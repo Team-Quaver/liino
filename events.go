@@ -88,6 +88,7 @@ type Snapshot struct {
 	Position time.Duration `json:"position"`
 	Duration time.Duration `json:"duration"`
 	Buffered time.Duration `json:"buffered"`
+	Latency  time.Duration `json:"latency"`
 
 	Volume float64 `json:"volume"`
 	Muted  bool    `json:"muted"`
@@ -149,6 +150,8 @@ type JSONShape struct {
 	PositionMS int64   `json:"position_ms"`
 	DurationMS int64   `json:"duration_ms"`
 	BufferedMS int64   `json:"buffered_ms"`
+	LatencyMS  int64   `json:"latency_ms"`
+	LatencyNS  int64   `json:"latency_ns"`
 	Volume     float64 `json:"volume"`
 	Muted      bool    `json:"muted"`
 	Driver     string  `json:"driver"`
@@ -171,6 +174,8 @@ func (s Snapshot) JSON() JSONShape {
 		PositionMS: ms(s.Position),
 		DurationMS: ms(s.Duration),
 		BufferedMS: ms(s.Buffered),
+		LatencyMS:  ms(s.Latency),
+		LatencyNS:  int64(s.Latency),
 		Volume:     s.Volume,
 		Muted:      s.Muted,
 		Driver:     s.Driver,

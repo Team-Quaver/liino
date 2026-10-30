@@ -626,6 +626,48 @@ func (p *Player) Snapshot() Snapshot {
 	return p.snapshotLocked()
 }
 
+// Clock is a high-precision view of the playback timeline. BufferPos is the
+// position of the last frame handed to the device; Position subtracts the
+// output latency to estimate what the listener hears right now. Monotonic is
+// Go's monotonic clock in nanoseconds, useful for aligning with Electron's
+// performance.now() or MyGO's timing source.
+type Clock struct {
+	Position   time.Duration
+	BufferPos  time.Duration
+	Latency    time.Duration
+	Monotonic  int64
+	Frames     uint64
+	SampleRate int
+}
+
+// Clock returns a point-in-time reading of the playback clock. It never blocks
+// on the device: use it for lyric sync, spectrum alignment, or any consumer
+// that needs sub-40ms precision beyond the event stream.
+func (p *Player) Clock() Clock {
+	p.mu.Lock()
+	bufferPos := p.clock.position(p.pulled.Load())
+	latency := time.Duration(0)
+	if p.out != nil {
+		latency = p.out.Latency()
+	}
+	frames := p.pulled.Load()
+	sampleRate := pcm.DefaultSampleRate
+	p.mu.Unlock()
+
+	position := bufferPos - latency
+	if position < 0 {
+		position = 0
+	}
+	return Clock{
+		Position:   position,
+		BufferPos:  bufferPos,
+		Latency:    latency,
+		Monotonic:  time.Now().UnixNano(),
+		Frames:     frames,
+		SampleRate: sampleRate,
+	}
+}
+
 // Events subscribes to the player. The returned cancel function unregisters the
 // listener; the channel is closed by it.
 func (p *Player) Events(size int) (<-chan Event, func()) {

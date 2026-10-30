@@ -55,6 +55,7 @@ int liino_set_bypass(liino_player *player, int bypass, char **err);
 /* Routing and status. */
 int liino_set_device(liino_player *player, const char *device_id, char **err);
 int liino_snapshot_json(liino_player *player, char **out_json);
+int liino_clock_json(liino_player *player, char **out_json);
 int liino_level_json(liino_player *player, char **out_json);
 
 /* Events: poll without blocking, or wait up to timeout_ms. */

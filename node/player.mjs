@@ -15,6 +15,8 @@ export {};
  * @property {number} position_ms
  * @property {number} duration_ms
  * @property {number} buffered_ms
+ * @property {number} latency_ms
+ * @property {number} latency_ns
  * @property {number} volume
  * @property {boolean} muted
  * @property {string} driver
@@ -26,6 +28,22 @@ export {};
  * @property {number} clips
  * @property {number} peak_l_db
  * @property {number} peak_r_db
+ */
+
+/**
+ * High-precision clock reading from {@link LiinoPlayer#clock}.
+ *
+ * `position_ms` estimates what the listener hears right now (buffer position
+ * minus output latency). `monotonic_ns` is Go's monotonic clock in
+ * nanoseconds for cross-process timing alignment.
+ * @typedef {object} PlayerClock
+ * @property {number} position_ms
+ * @property {number} buffer_pos_ms
+ * @property {number} latency_ms
+ * @property {number} latency_ns
+ * @property {number} monotonic_ns
+ * @property {number} frames
+ * @property {number} sample_rate
  */
 
 /**

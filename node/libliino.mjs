@@ -90,6 +90,7 @@ export class Liino {
     this.setBypassFn = this.lib.func('int liino_set_bypass(void *player, int bypass, _Out_ LiinoHeapStr *err)');
     this.setDeviceFn = this.lib.func('int liino_set_device(void *player, const char *device_id, _Out_ LiinoHeapStr *err)');
     this.snapshotFn = this.lib.func('int liino_snapshot_json(void *player, _Out_ LiinoHeapStr *out)');
+    this.clockFn = this.lib.func('int liino_clock_json(void *player, _Out_ LiinoHeapStr *out)');
     this.levelFn = this.lib.func('int liino_level_json(void *player, _Out_ LiinoHeapStr *out)');
     this.nextEventFn = this.lib.func('int liino_next_event(void *player, _Out_ LiinoHeapStr *out)');
     this.waitEventFn = this.lib.func('int liino_wait_event(void *player, int timeout_ms, _Out_ LiinoHeapStr *out)');
@@ -137,6 +138,7 @@ export class LiinoPlayer {
   setDevice(deviceID) { this.#call(this.lib.setDeviceFn, this.handle, deviceID ?? ''); }
 
   snapshot() { return readOutput(this.lib.snapshotFn, [this.handle]); }
+  clock() { return readOutput(this.lib.clockFn, [this.handle]); }
   level() { return readOutput(this.lib.levelFn, [this.handle]); }
   nextEvent() { return readOutput(this.lib.nextEventFn, [this.handle]); }
   waitEvent(timeoutMS) { return readOutput(this.lib.waitEventFn, [this.handle, Math.trunc(Number(timeoutMS) || 0)]); }

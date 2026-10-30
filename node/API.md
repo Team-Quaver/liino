@@ -26,6 +26,12 @@ player.setVolume(0.4);
 
 // Position is media time; seek is asynchronous and updates seek_gen.
 player.seek(30_000);
+
+// For sub-40ms precision (lyrics, spectrum, A/V sync), query the clock
+// directly instead of waiting for the next event.
+const clock = player.clock();
+console.log('audible position:', clock.position_ms, 'latency:', clock.latency_ms);
+
 player.stop();
 player.close();
 ```
@@ -38,6 +44,11 @@ player.close();
 - `snapshot()` returns `{ state, position_ms, duration_ms, buffered_ms,
   volume, muted, driver, device, decoder, codec, underruns, clips,
   peak_l_db, peak_r_db, live }`.
+- `clock()` returns a point-in-time high-precision reading:
+  `{ position_ms, buffer_pos_ms, latency_ms, latency_ns, monotonic_ns,
+  frames, sample_rate }`. `position_ms` subtracts the output latency from
+  `buffer_pos_ms` to estimate what the listener hears; `monotonic_ns` is
+  Go's monotonic clock for aligning with Electron's `performance.now()`.
 - Event kinds: `loaded`, `playing`, `paused`, `buffering`, `ready`, `ended`,
   `stopped`, `failed`, `closed`. Every event carries monotonic `gen` and
   `seek_gen`; drop callbacks for older generations.

@@ -332,6 +332,25 @@ func liino_snapshot_json(key *C.struct_liino_player, out **C.char) C.int {
 	return codeOK
 }
 
+//export liino_clock_json
+func liino_clock_json(key *C.struct_liino_player, out **C.char) C.int {
+	h, ok := lookup(key)
+	if !ok || out == nil {
+		return codeClosed
+	}
+	clock := h.player.Clock()
+	*out = cString(map[string]any{
+		"position_ms": clock.Position.Milliseconds(),
+		"buffer_pos_ms": clock.BufferPos.Milliseconds(),
+		"latency_ms": clock.Latency.Milliseconds(),
+		"latency_ns": clock.Latency.Nanoseconds(),
+		"monotonic_ns": clock.Monotonic,
+		"frames": clock.Frames,
+		"sample_rate": clock.SampleRate,
+	})
+	return codeOK
+}
+
 //export liino_level_json
 func liino_level_json(key *C.struct_liino_player, out **C.char) C.int {
 	h, ok := lookup(key)

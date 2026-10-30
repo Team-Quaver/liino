@@ -491,6 +491,7 @@ func (p *Player) snapshotLocked() Snapshot {
 		}
 		snap.Device = p.device.Name
 		snap.Underruns = p.out.Underruns()
+		snap.Latency = p.out.Latency()
 	}
 	if p.err != nil {
 		snap.Error = p.err.Error()
