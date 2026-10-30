@@ -1,26 +1,33 @@
 {
   "name": "@team-quaver/liino-node",
   "version": "0.1.0",
-  "description": "Node/Electron FFI bindings for the Liino native audio backend (libliino, no WASM)",
+  "description": "Node/Electron TypeScript bindings for the Liino native audio backend (libliino, no WASM)",
   "license": "AGPL-3.0-only",
   "type": "module",
-  "main": "index.mjs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./index.mjs",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
-    "index.mjs",
-    "libliino.mjs",
-    "player.mjs",
+    "dist",
     "API.md"
   ],
   "scripts": {
-    "smoke": "node smoke.mjs",
-    "test": "node smoke.mjs --driver null --seconds 1"
+    "build": "tsc -p tsconfig.json",
+    "smoke": "npm run build && node dist/smoke.js",
+    "test": "npm run build && node dist/smoke.js --driver null --seconds 1"
   },
   "peerDependencies": {
     "koffi": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3"
   },
   "engines": {
     "node": ">=18"
