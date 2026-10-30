@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Generate the small audio fixtures the native decoder tests need.
+# They are not committed: run this once, then `go test ./...` picks them up.
+#
+# Channels carry different frequencies on purpose: a decoder that mixes up
+# planes or channel counts still produces sound, but it no longer passes the
+# per-channel assertions in decode/native.
+set -euo pipefail
+dir="${1:-$(dirname "$0")/../testdata}"
+mkdir -p "$dir"
+command -v ffmpeg >/dev/null || { echo "ffmpeg is required" >&2; exit 1; }
+
+tone() { # tone <exprs> <rate> <seconds>
+	local exprs=$1 rate=$2 secs=$3
+	echo "aevalsrc=${exprs}:d=${secs}:s=${rate}"
+}
+
+# 44.1kHz stereo MP3: resampled to the canonical 48kHz stereo.
+ffmpeg -v error -y -f lavfi -i "$(tone '.3*sin(2*PI*440*t)|.3*sin(2*PI*880*t)' 44100 3)" \
+	-ac 2 -channel_layout stereo -c:a libmp3lame -b:a 128k "$dir/tone-44100-stereo.mp3"
+
+# 96kHz mono FLAC: downsampled and duplicated onto both ears.
+ffmpeg -v error -y -f lavfi -i "$(tone '.3*sin(2*PI*880*t)' 96000 2)" \
+	-ac 1 -channel_layout mono -c:a flac "$dir/tone-96000-mono.flac"
+
+# 48kHz stereo Ogg/Vorbis: native rate, read through an in-memory reader.
+ffmpeg -v error -y -f lavfi -i "$(tone '.25*sin(2*PI*220*t)|.25*sin(2*PI*330*t)' 48000 2)" \
+	-ac 2 -channel_layout stereo -c:a libvorbis -q 5 "$dir/tone-48000-stereo.ogg"
+
+# 5.1 FLAC: exercises the multichannel downmix path.
+ffmpeg -v error -y -f lavfi -i \
+	"$(tone '.15*sin(2*PI*220*t)|.15*sin(2*PI*330*t)|.15*sin(2*PI*440*t)|.15*sin(2*PI*550*t)|.15*sin(2*PI*660*t)|.15*sin(2*PI*770*t)' 48000 2)" \
+	-ac 6 -channel_layout 5.1 -c:a flac "$dir/tone-48000-51.flac"
+
+for f in "$dir"/tone-*; do
+	printf '%s\n' "$(basename "$f"): $(ffprobe -v error -show_entries stream=sample_rate,channels,channel_layout -of csv=p=0 "$f")"
+done

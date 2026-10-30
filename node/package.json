@@ -1,0 +1,28 @@
+{
+  "name": "@team-quaver/liino-node",
+  "version": "0.1.0",
+  "description": "Node/Electron FFI bindings for the Liino native audio backend (libliino, no WASM)",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "libliino.mjs",
+    "player.mjs",
+    "API.md"
+  ],
+  "scripts": {
+    "smoke": "node smoke.mjs",
+    "test": "node smoke.mjs --driver null --seconds 1"
+  },
+  "peerDependencies": {
+    "koffi": "^2.9.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

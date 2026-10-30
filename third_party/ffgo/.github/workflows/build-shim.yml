@@ -1,0 +1,247 @@
+# Build ffshim for all supported platforms
+# This workflow builds the shim library on native runners for maximum compatibility
+name: Build Shim
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'shim/**'
+      - '.github/workflows/build-shim.yml'
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'shim/**'
+      - '.github/workflows/build-shim.yml'
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      upload_artifacts:
+        description: 'Upload artifacts even on non-release builds'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+    name: Build (linux/amd64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev
+
+      - name: Build shim
+        working-directory: shim
+        run: |
+          make native
+          mkdir -p prebuilt/linux-amd64
+          cp libffshim.so prebuilt/linux-amd64/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-linux-amd64
+          path: shim/prebuilt/linux-amd64/
+
+  build-linux-arm64:
+    runs-on: ubuntu-latest
+    name: Build (linux/arm64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain + arm64 FFmpeg development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config
+
+          sudo dpkg --add-architecture arm64
+
+          # The default Ubuntu sources on amd64 runners don't publish arm64 indexes
+          # for security.ubuntu.com, so after enabling multiarch we must explicitly
+          # pin amd64 repos to amd64 and use ports.ubuntu.com for arm64.
+          codename="$(lsb_release -cs)"
+
+          # Ubuntu 24.04 runners use deb822 .sources files by default. If we leave
+          # them enabled after adding arm64, apt will try to fetch arm64 indexes
+          # from security.ubuntu.com and fail with 404s. Replace sources with an
+          # explicit multiarch configuration.
+          sudo rm -f /etc/apt/sources.list.d/*.sources || true
+          sudo rm -f /etc/apt/sources.list.d/*.list || true
+
+          sudo tee /etc/apt/sources.list >/dev/null <<EOF
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${codename} main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${codename}-updates main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu ${codename}-backports main restricted universe multiverse
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu ${codename}-security main restricted universe multiverse
+          EOF
+
+          sudo tee /etc/apt/sources.list.d/arm64-ports.list >/dev/null <<EOF
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename} main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-backports main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main restricted universe multiverse
+          EOF
+
+          sudo apt-get update
+
+          # Install arm64 FFmpeg dev libs (used by the cross linker).
+          sudo apt-get install -y libavutil-dev:arm64 libavcodec-dev:arm64 libavformat-dev:arm64
+
+      - name: Build shim
+        working-directory: shim
+        env:
+          CC: aarch64-linux-gnu-gcc
+          PKG_CONFIG: pkg-config
+          PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+        run: |
+          mkdir -p prebuilt/linux-arm64
+          aarch64-linux-gnu-gcc -shared -fPIC -Wall -Wextra -O2 \
+            $(pkg-config --cflags libavutil libavcodec libavformat) \
+            -o prebuilt/linux-arm64/libffshim.so ffshim.c \
+            $(pkg-config --libs libavutil libavcodec libavformat)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-linux-arm64
+          path: shim/prebuilt/linux-arm64/
+
+  # Build on macOS (both amd64 and arm64 native)
+  build-macos-amd64:
+    runs-on: macos-15-intel
+    name: Build (darwin/amd64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+
+      - name: Build shim
+        working-directory: shim
+        run: |
+          make native
+          mkdir -p prebuilt/darwin-amd64
+          cp libffshim.dylib prebuilt/darwin-amd64/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-darwin-amd64
+          path: shim/prebuilt/darwin-amd64/
+
+  build-macos-arm64:
+    runs-on: macos-15
+    name: Build (darwin/arm64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+
+      - name: Build shim
+        working-directory: shim
+        run: |
+          make native
+          mkdir -p prebuilt/darwin-arm64
+          cp libffshim.dylib prebuilt/darwin-arm64/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-darwin-arm64
+          path: shim/prebuilt/darwin-arm64/
+
+  # Build on Windows
+  build-windows-amd64:
+    runs-on: windows-latest
+    name: Build (windows/amd64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-ffmpeg
+            pkg-config
+
+      - name: Build shim
+        shell: msys2 {0}
+        working-directory: shim
+        run: |
+          make native
+          mkdir -p prebuilt/windows-amd64
+          cp ffshim.dll prebuilt/windows-amd64/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-windows-amd64
+          path: shim/prebuilt/windows-amd64/
+
+  # Combine all artifacts into a single release asset
+  package:
+    needs: [build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64, build-windows-amd64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package shims
+        run: |
+          mkdir -p release/shim/prebuilt
+
+          # Copy all platform shims
+          for dir in artifacts/shim-*/; do
+            platform=$(basename "$dir" | sed 's/shim-//')
+            if [ -d "$dir" ] && [ "$(ls -A "$dir")" ]; then
+              mkdir -p "release/shim/prebuilt/$platform"
+              cp -r "$dir"/* "release/shim/prebuilt/$platform/"
+            fi
+          done
+
+          # Create archive
+          cd release
+          tar -czvf ../ffshim-prebuilt.tar.gz shim/
+          cd ..
+
+          # Create checksums
+          sha256sum ffshim-prebuilt.tar.gz > ffshim-prebuilt.tar.gz.sha256
+
+      - name: Upload release asset
+        # Avoid "skipped" steps: always run and no-op on non-release events.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" != "release" ]; then
+            echo "Not a release event (${GITHUB_EVENT_NAME}); skipping release upload."
+            exit 0
+          fi
+
+          tag="${GITHUB_REF_NAME}"
+          echo "Uploading prebuilt shims to release ${tag}..."
+          gh release upload "${tag}" ffshim-prebuilt.tar.gz ffshim-prebuilt.tar.gz.sha256 --clobber
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffshim-prebuilt
+          path: |
+            ffshim-prebuilt.tar.gz
+            ffshim-prebuilt.tar.gz.sha256
