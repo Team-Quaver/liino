@@ -50,7 +50,20 @@ func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options)
 	if opts.AnalyzeDuration > 0 {
 		fopts.AnalyzeDuration = opts.AnalyzeDuration
 	}
-	if av := avOptions(src.Options); len(av) > 0 {
+	av := avOptions(src.Options)
+	// Network sources go through FFmpeg's default AVIO stack, which has no read
+	// deadline by default: a stalled CDN connection parks the decoder goroutine
+	// forever and Close() waits on it. 5 s is long enough for a healthy range
+	// read and short enough to turn a dead peer into a normal playback error.
+	if hasScheme(src.URI) {
+		if av == nil {
+			av = make(map[string]string)
+		}
+		if _, ok := av["rw_timeout"]; !ok {
+			av["rw_timeout"] = "5000000"
+		}
+	}
+	if len(av) > 0 {
 		fopts.AVOptions = av
 	}
 

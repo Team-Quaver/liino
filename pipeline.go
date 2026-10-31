@@ -59,14 +59,22 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 	if p.meta.SampleRate > 0 {
 		p.chain.SetFormat(pcm.DefaultSampleRate, pcm.DefaultChannels)
 	}
-	if startAt > 0 && p.meta.Seekable {
+	seekable := p.meta.Seekable
+	p.mu.Unlock()
+
+	// Seek **outside the player lock**: on an HTTP source this reads ranges from
+	// the network and can stall for seconds. Holding mu here blocks every FFI
+	// call the host makes on its UI thread (clock/snapshot/nextEvent) — the app
+	// window stays painted while the main process is frozen and silent.
+	if startAt > 0 && seekable {
 		if _, err := stream.Seek(startAt); err != nil {
-			p.mu.Unlock()
 			_ = stream.Close()
 			p.failGen(gen, fmt.Errorf("seek to start: %w", err))
 			return
 		}
 	}
+
+	p.mu.Lock()
 	if p.state == StateLoading {
 		p.state = StateReady
 	}
@@ -227,10 +235,22 @@ func (p *Player) failGen(gen uint64, err error) {
 // ensureOutput opens the device session lazily: New() must not grab an audio
 // endpoint, otherwise a headless process could never even construct a player.
 func (p *Player) ensureOutput(deviceID string) error {
+	// Serialise opens, but never hold p.mu across output.Open: PipeWire stream
+	// creation waits on the session manager and can block arbitrarily. With mu
+	// held there, every FFI call from the host (clock/snapshot/nextEvent) parks
+	// on the Electron main thread — the window keeps painting, audio never
+	// starts, and switching backend appears dead.
+	p.openMu.Lock()
+	defer p.openMu.Unlock()
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.out != nil {
+		p.mu.Unlock()
 		return nil
+	}
+	if p.closed {
+		p.mu.Unlock()
+		return ErrClosed
 	}
 	driverName := p.cfg.Driver
 	opts := output.Options{
@@ -248,27 +268,46 @@ func (p *Player) ensureOutput(deviceID string) error {
 		},
 		Log: p.cfg.Log,
 	}
+	p.mu.Unlock()
+
 	out, driver, err := output.Open(driverName, opts)
 	if err != nil {
 		return err
 	}
-	p.out = out
-	p.driver = driver
-	p.cfg.Driver = driver.Name()
-	p.device = out.Device()
-	if p.device.ID == "" {
+
+	dev := out.Device()
+	if dev.ID == "" {
 		// Remember the concrete endpoint even when the default was requested:
 		// the device watcher needs an identity to check for disappearance.
 		if devs, err := driver.Devices(); err == nil {
 			for _, d := range devs {
-				if d.Default || p.device.Name == "" {
-					p.device = d
+				if d.Default || dev.Name == "" {
+					dev = d
 					break
 				}
 			}
 		}
 	}
-	p.logf("output %s opened on %q (latency %s)", driver.Name(), p.device.Name, out.Latency())
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		_ = out.Close()
+		return ErrClosed
+	}
+	if p.out != nil {
+		// Another caller won the race while we were opening; drop ours.
+		p.mu.Unlock()
+		_ = out.Close()
+		return nil
+	}
+	p.out = out
+	p.driver = driver
+	p.cfg.Driver = driver.Name()
+	p.device = dev
+	p.mu.Unlock()
+
+	p.logf("output %s opened on %q (latency %s)", driver.Name(), dev.Name, out.Latency())
 	return nil
 }
 

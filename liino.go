@@ -151,7 +151,11 @@ type Player struct {
 	hub   *eventBus
 	clock *clock
 
-	mu          sync.Mutex
+	mu sync.Mutex
+	// openMu serialises device opens without holding mu: PipeWire/WASAPI stream
+	// creation may block for an unbounded time, and FFI callers (clock/snapshot)
+	// must never wait on it from the host's UI thread.
+	openMu      sync.Mutex
 	state       State
 	src         decode.Source
 	meta        decode.Meta

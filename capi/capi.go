@@ -188,7 +188,13 @@ func liino_destroy(key *C.struct_liino_player) {
 		return
 	}
 	h.cancel()
-	_ = h.player.Close()
+	// Close() waits for the decoder goroutine, which may be parked in a network
+	// read (FFmpeg has no read deadline we control from every caller). The host
+	// calls destroy from its UI thread through FFI: blocking here freezes the
+	// whole application while a backend switch waits for TCP. Detach instead;
+	// the library stays loaded, so the goroutine's code remains valid and it
+	// tears the stream down as soon as the read returns or times out.
+	go func() { _ = h.player.Close() }()
 }
 
 //export liino_open
@@ -236,7 +242,15 @@ func liino_pause(key *C.struct_liino_player, errp **C.char) C.int {
 
 //export liino_stop
 func liino_stop(key *C.struct_liino_player, errp **C.char) C.int {
-	return call(key, errp, func(h *handle) error { return h.player.Stop() })
+	h, ok := lookup(key)
+	if !ok {
+		return codeClosed
+	}
+	// Stop() may have to close the decoder stream (paused/idle sources) and that
+	// can wait on the network. Detach so the host's UI thread never parks here;
+	// state transitions still arrive through the event stream.
+	go func() { _ = h.player.Stop() }()
+	return codeOK
 }
 
 //export liino_seek_ms
@@ -316,9 +330,15 @@ func liino_set_device(key *C.struct_liino_player, deviceID *C.char, errp **C.cha
 	if deviceID != nil {
 		id = C.GoString(deviceID)
 	}
-	if err := h.player.SetDevice(id); err != nil {
-		return report(errp, err)
+	// Validate synchronously (registry lookup only), then detach the actual
+	// stream rebuild: opening a new PipeWire/WASAPI session may block and the
+	// caller is the host's UI thread.
+	if id != "" {
+		if _, _, err := output.FindDevice(id); err != nil {
+			return report(errp, err)
+		}
 	}
+	go func() { _ = h.player.SetDevice(id) }()
 	return codeOK
 }
 
@@ -340,13 +360,13 @@ func liino_clock_json(key *C.struct_liino_player, out **C.char) C.int {
 	}
 	clock := h.player.Clock()
 	*out = cString(map[string]any{
-		"position_ms": clock.Position.Milliseconds(),
+		"position_ms":   clock.Position.Milliseconds(),
 		"buffer_pos_ms": clock.BufferPos.Milliseconds(),
-		"latency_ms": clock.Latency.Milliseconds(),
-		"latency_ns": clock.Latency.Nanoseconds(),
-		"monotonic_ns": clock.Monotonic,
-		"frames": clock.Frames,
-		"sample_rate": clock.SampleRate,
+		"latency_ms":    clock.Latency.Milliseconds(),
+		"latency_ns":    clock.Latency.Nanoseconds(),
+		"monotonic_ns":  clock.Monotonic,
+		"frames":        clock.Frames,
+		"sample_rate":   clock.SampleRate,
 	})
 	return codeOK
 }

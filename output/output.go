@@ -336,7 +336,11 @@ func FindDevice(id string) (Device, Driver, error) {
 			continue
 		}
 		for _, dev := range devs {
-			if (split && dev.ID == want) || (!split && dev.ID == id) {
+			// IDs may or may not carry the driver prefix ("pipewire/default" vs
+			// "default"). Splitting the lookup key must not lose a dev whose
+			// advertised ID is the prefixed form, otherwise requesting the
+			// default sink reports "no such device".
+			if (split && (dev.ID == want || dev.ID == id)) || (!split && dev.ID == id) {
 				return dev, d, nil
 			}
 		}
