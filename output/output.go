@@ -415,18 +415,17 @@ func (p *Pump) FillPlanar(planar [][]float32, frames, stride int) int {
 	if len(planar) == 0 || frames <= 0 {
 		return 0
 	}
+	// FillPlanar receives PipeWire's planar callback buffers. Read one coherent
+	// interleaved chunk, then write it into the native rows. Stride belongs to
+	// the backend layout and is measured in bytes here (float32 = 4), not in
+	// float32 elements; deinterleaving must advance one sample per frame.
+	ch := minInt(p.format.Channels, len(planar))
 	p.scratch = ensureFrames(p.scratch, frames)
-	n := p.src.Read(p.scratch[:frames*p.format.Channels])
+	n := p.src.Read(p.scratch[:frames*ch])
 	if n > frames {
 		n = frames
 	}
-	p.planar = ensurePlanar(p.planar, len(planar), frames*maxInt(stride, 1))
-	pcm.Deinterleave(p.planar, p.scratch[:n*p.format.Channels], n, maxInt(stride, 1))
-	for c := range planar {
-		row := planar[c]
-		lim := minInt(len(row), frames*maxInt(stride, 1))
-		copy(row[:lim], p.planar[c][:lim])
-	}
+	pcm.Deinterleave(planar, p.scratch[:n*ch], n, 1)
 	if gaps := frames - n; gaps > 0 {
 		p.underruns.Add(1)
 		if p.onUnderrun != nil {
