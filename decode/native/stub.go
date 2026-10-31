@@ -19,3 +19,6 @@ func (backend) Probe() (bool, string) {
 func (backend) Open(context.Context, decode.Source, decode.Options) (decode.Stream, error) {
 	return nil, fmt.Errorf("%w: %s/%s", decode.ErrUnavailable, goOS(), goArch())
 }
+
+// Codecs reports nothing: ffgo cannot load at all on these platforms.
+func (backend) Codecs() []string { return nil }

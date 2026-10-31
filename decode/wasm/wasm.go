@@ -94,8 +94,11 @@ type backend struct{}
 
 func init() { decode.Register(backend{}) }
 
-func (backend) Name() string  { return Name }
-func (backend) Priority() int { return 10 }
+func (backend) Name() string { return Name }
+
+// Priority is last: the helper costs a Node process per stream and its pure-Go
+// resampler is stateless, so it only runs after platform and FFmpeg backends.
+func (backend) Priority() int { return 20 }
 
 func (backend) Probe() (bool, string) {
 	c := currentConfig()

@@ -1,9 +1,13 @@
 github.com/bnema/purego v0.11.0-bnema.3 h1:lpTXuapRIBH2OTgLJTjYlK1olHmZkEQLloqgP8zpocs=
 github.com/bnema/purego v0.11.0-bnema.3/go.mod h1:5BnOIUj+0fvk/vwv45iottFoGfkDT7cnLXnpM2s6Hng=
-github.com/bnema/purego-pipewire v0.1.6 h1:olbxeiqIJZXil0pus5Uzh9psH/KTI9GovqTCuPXTquU=
-github.com/bnema/purego-pipewire v0.1.6/go.mod h1:57aFYl3Wll3XbrwblQjmX8R1k7RkcZQwfQTGQWcKbdc=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/deploymenttheory/go-bindings-macosplatform v0.20.1 h1:82pe8s9LENzyL2R2C1Ner6VA7+VIgYIC6nGs3j0CGbw=
+github.com/deploymenttheory/go-bindings-macosplatform v0.20.1/go.mod h1:9nrs7NE5Sr4d5KF+zqWXMR2On1OStd7VpJdiIewBTf0=
+github.com/deploymenttheory/go-bindings-win32 v0.5.0 h1:B5qu2L+XvQRPe0/ni7Q9PAu3j3it94cyDJjGTeMLG/o=
+github.com/deploymenttheory/go-bindings-win32 v0.5.0/go.mod h1:J3mOfF0N1uFmI8Cm3GPtq1YJYnwAKUkOsmc36GYbm0w=
+github.com/ebitengine/purego v0.11.1 h1:2zpWRSQNVKN4eKsKO9eM1ILDgWfYMY9GwqRmK6XeQ/0=
+github.com/ebitengine/purego v0.11.1/go.mod h1:DCHPP08djqhNSoTfImcnHYQRZmd0qhakvrozqaEYhGQ=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/objx v0.5.2 h1:xuMeJ0Sdp5ZMRXx/aWO6RZxdr3beISkG5/G/aIRr3pY=

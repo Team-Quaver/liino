@@ -290,6 +290,19 @@ func TestMissingFileFailsFast(t *testing.T) {
 	}
 }
 
+// TestCodecsProbe is the Linux capability-detection check: it must report the
+// audio decoders the installed FFmpeg was actually built with.
+func TestCodecsProbe(t *testing.T) {
+	if ok, note := (backend{}).Probe(); !ok {
+		t.Skipf("ffgo unavailable: %s", note)
+	}
+	codecs := (backend{}).Codecs()
+	if len(codecs) == 0 {
+		t.Fatal("no audio decoders detected")
+	}
+	t.Logf("detected codecs: %v", codecs)
+}
+
 func absInt(v int) int {
 	if v < 0 {
 		return -v

@@ -8,18 +8,31 @@
 // downmix themselves, because swresample cannot rematrix layouts it does not
 // know (7.1.4 Opus reports 12 channels with no layout).
 //
-// Two backends ship with Liino:
+// Four backends ship with Liino:
 //
+//   - wmf: Windows Media Foundation's Source Reader (Windows only). It reaches
+//     the OS codec pack in-process, so MP3/AAC/FLAC/ALAC/WMA and anything else
+//     the machine already supports decode without shipping FFmpeg.
+//   - avf: AVFoundation + CoreMedia (macOS only). AVAssetReader decodes through
+//     the same Core Audio codecs Finder/QuickTime use.
 //   - native: ffgo, pure Go bindings that dlopen the system FFmpeg
 //     (libavformat/libavcodec/libavutil/libswresample) through purego. No CGO,
-//     no bundled FFmpeg binaries.
+//     no bundled FFmpeg binaries. It is the primary backend on Linux and the
+//     fallback everywhere else, covering containers/codecs the OS lacks
+//     (Ogg/Opus, APE, DSD, 7.1.4 Opus, ...).
 //   - wasm: a libav.js helper process (Node) that emits PCM over a pipe, used
 //     where no FFmpeg is available and a bundled runtime is acceptable.
+//
+// Platform backends are preferred by priority, but no OS decoder covers every
+// container Quaver serves. OpenAuto therefore walks the registry per source:
+// Guard.Supports skips backends that cannot possibly work, and a backend that
+// fails with ErrUnsupported hands the source to the next one.
 package decode
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -48,6 +61,12 @@ var (
 	// frames reveal a usable sample rate and channel count. Resampling cannot
 	// start without them, so failing loudly beats feeding garbage downstream.
 	ErrBadFormat = errors.New("decode: cannot determine source audio format")
+	// ErrUnsupported is returned by a backend that recognised the source but
+	// cannot decode it here - a container or codec the OS does not ship, a
+	// byte-stream source where the platform API needs a URL. OpenAuto treats it
+	// as a request to try the next registered backend instead of failing the
+	// track.
+	ErrUnsupported = errors.New("decode: source not supported by backend")
 )
 
 // Source describes what to decode.
@@ -129,8 +148,25 @@ type Backend interface {
 	// Probe reports whether the backend can decode in this process right now,
 	// plus a human-readable note for the UI and logs.
 	Probe() (ok bool, note string)
-	// Open starts decoding src. ctx cancels a slow open.
+	// Open starts decoding src. ctx cancels a slow open. A backend that cannot
+	// handle src's container/codec returns ErrUnsupported so the caller can
+	// fall back to the next one.
 	Open(ctx context.Context, src Source, opts Options) (Stream, error)
+}
+
+// Guard is an optional Backend extension. It lets a backend reject a source
+// before Open pays for a URL fetch, a media-source creation, or a helper
+// process. OpenAuto consults it before every attempt.
+type Guard interface {
+	Supports(src Source) (ok bool, reason string)
+}
+
+// Reporter is an optional Backend extension used by diagnostics. Codecs lists
+// the audio codecs this backend can actually decode in this process, so the
+// settings UI can explain why a track needs another backend. It must be cheap
+// after the first call and must not decode media.
+type Reporter interface {
+	Codecs() []string
 }
 
 var (
@@ -192,10 +228,11 @@ func Default() (Backend, error) {
 
 // Status describes one backend for diagnostics.
 type Status struct {
-	Name      string `json:"name"`
-	Priority  int    `json:"priority"`
-	Available bool   `json:"available"`
-	Note      string `json:"note,omitempty"`
+	Name      string   `json:"name"`
+	Priority  int      `json:"priority"`
+	Available bool     `json:"available"`
+	Note      string   `json:"note,omitempty"`
+	Codecs    []string `json:"codecs,omitempty"`
 }
 
 // Statuses reports all backends, for the settings UI and the doctor command.
@@ -203,28 +240,95 @@ func Statuses() []Status {
 	out := make([]Status, 0, len(registry))
 	for _, b := range Backends() {
 		ok, note := b.Probe()
-		out = append(out, Status{Name: b.Name(), Priority: b.Priority(), Available: ok, Note: note})
+		st := Status{Name: b.Name(), Priority: b.Priority(), Available: ok, Note: note}
+		if r, ok := b.(Reporter); ok {
+			st.Codecs = r.Codecs()
+		}
+		out = append(out, st)
 	}
 	return out
 }
 
-// OpenWith opens src on the named backend, falling back to the default one
-// when name is empty.
+// OpenWith opens src on the named backend. An empty name means auto: the
+// backend registry is walked in priority order, with per-source fallback (see
+// OpenAuto).
 func OpenWith(ctx context.Context, name string, src Source, opts Options) (Stream, Backend, error) {
+	if name == "" {
+		return OpenAuto(ctx, src, opts)
+	}
 	b, err := resolve(name)
 	if err != nil {
 		return nil, nil, err
 	}
-	if opts.OpenTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opts.OpenTimeout)
-		defer cancel()
-	}
+	ctx, cancel := withOpenTimeout(ctx, opts)
+	defer cancel()
 	st, err := b.Open(ctx, src, opts)
 	if err != nil {
 		return nil, b, err
 	}
 	return st, b, nil
+}
+
+// OpenAuto opens src with the first backend that can actually decode it.
+//
+// Priority picks the preferred backend, but platform decoders do not cover
+// every container: Media Foundation and AVFoundation both lack Ogg/Opus and
+// several lossless formats. A backend therefore either rejects the source up
+// front (Guard.Supports) or returns ErrUnsupported from Open, and the next
+// backend is tried. Errors that are not "unsupported" are still recorded and
+// the walk continues, because a platform decoder can fail on a file FFmpeg
+// reads cleanly. The joined error is returned only when every candidate failed.
+func OpenAuto(ctx context.Context, src Source, opts Options) (Stream, Backend, error) {
+	ctx, cancel := withOpenTimeout(ctx, opts)
+	defer cancel()
+
+	var errs []error
+	for _, b := range Backends() {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		if ok, note := b.Probe(); !ok {
+			if note != "" {
+				errs = append(errs, fmt.Errorf("%s: %s", b.Name(), note))
+			}
+			continue
+		}
+		if g, ok := b.(Guard); ok {
+			if ok, note := g.Supports(src); !ok {
+				if note != "" {
+					errs = append(errs, fmt.Errorf("%s: %s", b.Name(), note))
+				}
+				continue
+			}
+		}
+		st, err := b.Open(ctx, src, opts)
+		if err == nil {
+			return st, b, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", b.Name(), err))
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if len(errs) == 0 {
+		return nil, nil, ErrNoBackend
+	}
+	return nil, nil, errors.Join(errs...)
+}
+
+// OpenFor resolves the configured decoder. An empty name means per-source
+// auto-selection with fallback; an explicit name disables fallback, because
+// the user asked for that backend.
+func OpenFor(ctx context.Context, name string, src Source, opts Options) (Stream, Backend, error) {
+	return OpenWith(ctx, name, src, opts)
+}
+
+func withOpenTimeout(ctx context.Context, opts Options) (context.Context, context.CancelFunc) {
+	if opts.OpenTimeout > 0 {
+		return context.WithTimeout(ctx, opts.OpenTimeout)
+	}
+	return ctx, func() {}
 }
 
 func resolve(name string) (Backend, error) {

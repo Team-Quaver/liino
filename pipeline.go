@@ -85,12 +85,14 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 	if p.stale(gen) {
 		return
 	}
-	backend, err := p.resolveDecoder()
-	if err != nil {
-		p.failGen(gen, fmt.Errorf("decoder: %w", err))
-		return
-	}
-	stream, err := backend.Open(ctx, src, p.decodeOptions())
+	p.mu.Lock()
+	decoderName := p.cfg.Decoder
+	p.mu.Unlock()
+
+	// OpenFor with an empty name walks every backend in priority order and
+	// retries the next one when the platform decoder cannot handle this
+	// container/codec. An explicitly configured decoder is honoured as-is.
+	stream, backend, err := decode.OpenFor(ctx, decoderName, src, p.decodeOptions())
 	if err != nil {
 		if p.stale(gen) {
 			return
@@ -246,23 +248,6 @@ func (p *Player) applyPendingSeek(gen uint64, stream decode.Stream) error {
 	p.nudge()
 	p.logf("seeked to %s", target)
 	return nil
-}
-
-// resolveDecoder picks the configured backend, or the first usable one.
-func (p *Player) resolveDecoder() (decode.Backend, error) {
-	p.mu.Lock()
-	name := p.cfg.Decoder
-	p.mu.Unlock()
-	if name != "" {
-		if b, ok := decode.Lookup(name); ok {
-			if ok, note := b.Probe(); ok {
-				return b, nil
-			} else if p.cfg.Decoder != "" {
-				return nil, fmt.Errorf("%w: %s: %s", decode.ErrUnavailable, name, note)
-			}
-		}
-	}
-	return decode.Default()
 }
 
 func (p *Player) decodeOptions() decode.Options {

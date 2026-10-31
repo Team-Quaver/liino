@@ -13,10 +13,37 @@ import (
 	"time"
 
 	"github.com/team-quaver/ffgo"
+	"github.com/team-quaver/ffgo/avcodec"
 
 	"github.com/team-quaver/liino/decode"
 	"github.com/team-quaver/liino/pcm"
 )
+
+// probeCodecs are the decoders Liino cares about, in display order. Probing by
+// name is how Linux reports which audio decoding the installed FFmpeg actually
+// provides: distributions build subsets, and a missing libopus/libvorbis is a
+// runtime fact, not a build-time one.
+var probeCodecs = []struct{ name, label string }{
+	{"mp3", "mp3"},
+	{"aac", "aac"},
+	{"alac", "alac"},
+	{"flac", "flac"},
+	{"opus", "opus"},
+	{"vorbis", "vorbis"},
+	{"ac3", "ac3"},
+	{"eac3", "eac3"},
+	{"dca", "dts"},
+	{"truehd", "truehd"},
+	{"wmav1", "wma"},
+	{"wmav2", "wma"},
+	{"pcm_s16le", "pcm"},
+	{"pcm_f32le", "pcm"},
+	{"{{SECRET_rbt2n5xc}}", "pcm"},
+	{"pcm_s24le", "pcm"},
+	{"ape", "ape"},
+	{"dsd_lsbf", "dsd"},
+	{"dsd_msbf", "dsd"},
+}
 
 // Probe checks that the FFmpeg shared libraries resolve in this process.
 func (backend) Probe() (bool, string) {
@@ -25,6 +52,28 @@ func (backend) Probe() (bool, string) {
 	}
 	au, ac, af := ffgo.Version()
 	return true, fmt.Sprintf("ffmpeg avutil=%d avcodec=%d avformat=%d", au, ac, af)
+}
+
+// Codecs reports the audio decoders the loaded FFmpeg actually exposes. This is
+// the Linux capability detection: the platform decoder is always FFmpeg there,
+// so what matters is which codecs the installed libavcodec was built with.
+func (backend) Codecs() []string {
+	if err := ffgo.Init(); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(probeCodecs))
+	seen := make(map[string]struct{}, len(probeCodecs))
+	for _, c := range probeCodecs {
+		if avcodec.FindDecoderByName(c.name) == nil {
+			continue
+		}
+		if _, ok := seen[c.label]; ok {
+			continue
+		}
+		seen[c.label] = struct{}{}
+		out = append(out, c.label)
+	}
+	return out
 }
 
 // Open starts decoding src with FFmpeg.

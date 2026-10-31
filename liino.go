@@ -33,8 +33,10 @@ import (
 	"github.com/team-quaver/liino/pcm"
 
 	// Backends register themselves; the stubs are no-ops on other platforms.
+	_ "github.com/team-quaver/liino/decode/avf"
 	_ "github.com/team-quaver/liino/decode/native"
 	_ "github.com/team-quaver/liino/decode/wasm"
+	_ "github.com/team-quaver/liino/decode/wmf"
 	_ "github.com/team-quaver/liino/output/pipewire"
 	_ "github.com/team-quaver/liino/output/system"
 )
@@ -56,8 +58,9 @@ const (
 
 // Config sets up a Player. The zero value is valid.
 type Config struct {
-	// Decoder selects a decode backend name ("ffgo", "libavjs"); empty picks
-	// the first available one.
+	// Decoder selects a decode backend name ("wmf", "avf", "ffgo", "libavjs").
+	// Empty means automatic selection per source: platform backends first, then
+	// ffgo/libav.js when the OS cannot decode the container or codec.
 	Decoder string
 	// Driver selects an output driver ("wasapi", "coreaudio", "pipewire",
 	// "null"); empty picks the platform default.
@@ -93,11 +96,9 @@ type Config struct {
 }
 
 func (c *Config) withDefaults() error {
-	if c.Decoder == "" {
-		if b, err := decode.Default(); err == nil {
-			c.Decoder = b.Name()
-		}
-	}
+	// Decoder stays empty for automatic, per-source selection. Pinning it to the
+	// process default here would hide the platform decoder's fallback: a WMF
+	// machine would never hand an Ogg file to ffgo.
 	if _, ok := decode.Lookup(c.Decoder); c.Decoder != "" && !ok {
 		return fmt.Errorf("%w: decoder %q", ErrInvalidConfig, c.Decoder)
 	}

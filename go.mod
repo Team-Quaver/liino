@@ -1,8 +1,11 @@
 module github.com/team-quaver/liino
 
-go 1.26
+go 1.26.2
 
 require (
+	github.com/deploymenttheory/go-bindings-macosplatform v0.20.1
+	github.com/deploymenttheory/go-bindings-win32 v0.5.0
+	github.com/ebitengine/purego v0.11.1
 	github.com/team-quaver/ffgo v0.0.0
 	github.com/vcaesar/audio-go v0.10.0
 )
