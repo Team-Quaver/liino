@@ -1,0 +1,11 @@
+{
+  "libraries": [
+    {"name": "pipewire", "soname": "libpipewire-0.3.so.0"}
+  ],
+  "groups": [
+    {"name": "init", "interface": "InitAPI", "package": "out", "symbols": [""]}
+  ],
+  "symbols": [
+    {"name": "", "library": "pipewire", "group": "init", "signature": "func()"}
+  ]
+}

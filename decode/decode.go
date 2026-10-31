@@ -1,9 +1,12 @@
 // Package decode defines the decoder boundary of the Liino pipeline.
 //
 // A Backend turns a Source into a Stream of canonical PCM: interleaved
-// float32 at 48 kHz stereo (see package pcm). Everything downstream - DSP,
-// buffering, device output - only ever sees that shape, so adding a decoder
-// never touches the playback engine.
+// float32 at 48 kHz, keeping the source's channel count (see package pcm).
+// Everything downstream - DSP, buffering, device output - only ever sees that
+// shape, so adding a decoder never touches the playback engine. The player
+// folds channels to the endpoint's layout when they differ; decoders must not
+// downmix themselves, because swresample cannot rematrix layouts it does not
+// know (7.1.4 Opus reports 12 channels with no layout).
 //
 // Two backends ship with Liino:
 //
@@ -91,7 +94,7 @@ type Meta struct {
 // Stream is an open decoder session. Implementations are not safe for
 // concurrent use; the engine owns exactly one goroutine per stream.
 type Stream interface {
-	// Format is always the canonical 48 kHz stereo float32 layout.
+	// Format is canonical 48 kHz float32 at the source channel count.
 	Format() pcm.Format
 	// Meta returns container information valid from Open onwards.
 	Meta() Meta

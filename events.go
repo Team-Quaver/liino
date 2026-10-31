@@ -158,6 +158,8 @@ type JSONShape struct {
 	Device     string  `json:"device"`
 	Decoder    string  `json:"decoder"`
 	Codec      string  `json:"codec"`
+	SampleRate int     `json:"sample_rate"`
+	Channels   int     `json:"channels"`
 	Live       bool    `json:"live"`
 	Underruns  uint64  `json:"underruns"`
 	Clips      uint64  `json:"clips"`
@@ -182,6 +184,8 @@ func (s Snapshot) JSON() JSONShape {
 		Device:     s.Device,
 		Decoder:    s.Decoder,
 		Codec:      s.Codec,
+		SampleRate: s.SampleRate,
+		Channels:   s.Channels,
 		Live:       s.Live,
 		Underruns:  s.Underruns,
 		Clips:      s.Clips,

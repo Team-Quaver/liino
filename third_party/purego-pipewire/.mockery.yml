@@ -1,0 +1,26 @@
+all: false
+template: testify
+formatter: goimports
+dir: "{{.InterfaceDir}}/mocks"
+pkgname: mocks
+filename: "mock_{{.InterfaceName}}.go"
+structname: "Mock{{.InterfaceName}}"
+
+packages:
+  github.com/bnema/purego-pipewire/internal/ports/out:
+    config:
+      all: false
+      include-auto-generated: true
+    interfaces:
+      CAPI:
+      InitAPI:
+      LoopAPI:
+      StreamOps:
+  github.com/bnema/purego-pipewire/pipewire:
+    config:
+      all: false
+      include-auto-generated: true
+    interfaces:
+      Runtime:
+      MainLoop:
+      Player:

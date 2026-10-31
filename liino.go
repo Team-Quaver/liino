@@ -146,7 +146,21 @@ func (c *Config) withDefaults() error {
 type Player struct {
 	cfg Config
 
-	pipe  *pcm.Pipe
+	// pipe is replaced when a stream's channel count changes. The audio callback
+	// must never take a lock that a UI-thread FFI call can hold, so the pointer
+	// is atomic rather than guarded by p.mu.
+	pipe atomic.Pointer[pcm.Pipe]
+	// outChannels is the channel count the open endpoint was negotiated for.
+	// Read adapts the pipe's source layout to it (downmix/upmix) on the fly.
+	outChannels atomic.Int32
+	// readBuf is only touched by the output callback; it stages a multichannel
+	// read before folding it into the endpoint's layout.
+	readBuf []float32
+	// outGain is the consumer-side master gain. It runs after the ring so a
+	// volume move is heard immediately instead of waiting for seconds of
+	// already-processed audio to drain.
+	outGain *dsp.AtomicGain
+
 	chain *dsp.Pipeline
 	hub   *eventBus
 	clock *clock
@@ -192,8 +206,8 @@ func New(cfg Config) (*Player, error) {
 	}
 	p := &Player{
 		cfg:     cfg,
-		pipe:    pcm.NewPipe(cfg.RingFrames, pcm.DefaultFormat()),
 		chain:   dsp.NewPipeline(pcm.DefaultSampleRate, pcm.DefaultChannels),
+		outGain: dsp.NewAtomicGain(pcm.DefaultSampleRate),
 		hub:     newEventBus(),
 		clock:   newClock(pcm.DefaultSampleRate),
 		quit:    make(chan struct{}),
@@ -201,7 +215,13 @@ func New(cfg Config) (*Player, error) {
 		seekReq: make(chan time.Duration, 1),
 		volume:  cfg.Volume,
 	}
-	p.chain.SetVolume(cfg.Volume)
+	p.pipe.Store(pcm.NewPipe(cfg.RingFrames, pcm.DefaultFormat()))
+	p.outChannels.Store(int32(pcm.DefaultChannels))
+	// User volume lives on the consumer side; the producer chain stays at
+	// unity (EQ bands still run there). Preamp is folded into the gain value by
+	// the host, so it lands here too.
+	p.outGain.SetLinear(cfg.Volume)
+	p.outGain.Snap()
 	if len(cfg.EQ) > 0 {
 		if err := p.chain.SetBands(cfg.EQ); err != nil {
 			return nil, fmt.Errorf("%w: eq: %v", ErrInvalidConfig, err)
@@ -253,7 +273,7 @@ func (p *Player) Open(ctx context.Context, src decode.Source, opts OpenOptions) 
 	p.clock.base = maxDuration(opts.StartAt, 0)
 	// A stale producer is cut off by the token swap; its own loop notices the
 	// generation change and closes its stream.
-	p.pipe.Swap(gen)
+	p.pipe.Load().Swap(gen)
 	p.chain.Reset()
 	p.nudge()
 	p.mu.Unlock()
@@ -382,8 +402,8 @@ func (p *Player) hardStop() {
 	p.state = StateStopped
 	p.clock.base = 0
 	p.pulled.Store(0)
-	p.pipe.Interrupt()
-	p.pipe.Reset()
+	p.pipe.Load().Interrupt()
+	p.pipe.Load().Reset()
 	p.chain.Reset()
 	stream := p.stream
 	p.stream = nil
@@ -420,8 +440,8 @@ func (p *Player) Seek(d time.Duration) error {
 	p.pulled.Store(0)
 	p.eof = false
 	p.chain.Reset()
-	p.pipe.Reset()
-	p.pipe.Interrupt()
+	p.pipe.Load().Reset()
+	p.pipe.Load().Interrupt()
 	stream := p.stream
 	meta := p.meta
 	p.mu.Unlock()
@@ -449,7 +469,7 @@ func (p *Player) Seek(d time.Duration) error {
 			return
 		}
 		p.publish(Event{Kind: KindSeeked, SeekGen: seekGen})
-		p.pipe.Wake()
+		p.pipe.Load().Wake()
 	}()
 	return nil
 }
@@ -471,7 +491,7 @@ func (p *Player) SetVolume(v float64) {
 	if p.muted {
 		return
 	}
-	p.chain.SetVolume(v)
+	p.outGain.SetLinear(v)
 }
 
 // Volume reports the linear master gain the user asked for.
@@ -487,10 +507,10 @@ func (p *Player) SetMuted(muted bool) {
 	defer p.mu.Unlock()
 	p.muted = muted
 	if muted {
-		p.chain.SetVolume(0)
+		p.outGain.SetLinear(0)
 		return
 	}
-	p.chain.SetVolume(p.volume)
+	p.outGain.SetLinear(p.volume)
 }
 
 // Muted reports the mute flag.
@@ -562,8 +582,8 @@ func (p *Player) SetDevice(id string) error {
 	if err := p.switchDriverDevice(id); err != nil {
 		return err
 	}
-	p.pipe.Interrupt()
-	p.pipe.Reset()
+	p.pipe.Load().Interrupt()
+	p.pipe.Load().Reset()
 	p.chain.Reset()
 	p.clock.rebase(pos, 0)
 	p.pulled.Store(0)
@@ -705,7 +725,7 @@ func (p *Player) Close() error {
 	p.mu.Unlock()
 
 	close(p.quit)
-	p.pipe.Close()
+	p.pipe.Load().Close()
 	p.decWG.Wait()
 	p.monWG.Wait()
 
@@ -742,7 +762,7 @@ func (p *Player) reopen(at time.Duration, resume bool) error {
 	p.clock = newClock(pcm.DefaultSampleRate)
 	p.clock.base = at
 	p.state = StateLoading
-	p.pipe.Swap(gen)
+	p.pipe.Load().Swap(gen)
 	p.chain.Reset()
 	stream := p.stream
 	p.stream = nil

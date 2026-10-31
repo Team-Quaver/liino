@@ -94,6 +94,11 @@ func (driver) Open(opts output.Options) (output.Output, error) {
 		FramesPerBuffer: opts.PeriodFrames,
 		SampleFormat:    pw.SampleFormatF32,
 		UnderrunPolicy:  pw.UnderrunFillSilence,
+		// The OS mixer reads these; without them the client is named after the
+		// host binary (Electron shows up as "electron").
+		AppName:    opts.AppName,
+		StreamName: opts.StreamName,
+		MediaRole:  "Music",
 	}, pw.PlayerCallbacks{
 		Fill:       s.fill,
 		OnUnderrun: func(frames int) { s.Logf("graph underrun, %d frames filled with silence", frames) },

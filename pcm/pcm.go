@@ -262,17 +262,19 @@ func DownmixChannels(out, in []float32, frames, channels int) {
 		if len(out) >= frames*2 {
 			copy(out[:frames*2], in[:frames*2])
 		}
-	case 3: // L C R
+	case 3: // 2.1: L R LFE (FFmpeg's default layout for 3 channels)
 		for i := 0; i < frames; i++ {
-			c := in[i*3+1]
-			out[i*2] = in[i*3] + 0.7*c
-			out[i*2+1] = in[i*3+2] + 0.7*c
+			b := in[i*3:]
+			lfe := 0.5 * b[2]
+			out[i*2] = b[0] + lfe
+			out[i*2+1] = b[1] + lfe
 		}
-	case 4: // L R Sl Sr
+	case 4: // 4.0: L R C Bc
 		for i := 0; i < frames; i++ {
 			b := in[i*4:]
-			out[i*2] = b[0] + 0.7*b[2]
-			out[i*2+1] = b[1] + 0.7*b[3]
+			c := 0.7 * b[2]
+			out[i*2] = b[0] + c + 0.7*b[3]
+			out[i*2+1] = b[1] + c + 0.7*b[3]
 		}
 	case 5: // L R C Sl Sr
 		for i := 0; i < frames; i++ {
@@ -287,6 +289,13 @@ func DownmixChannels(out, in []float32, frames, channels int) {
 			out[i*2] = b[0] + 0.7*b[2] + 0.7*b[4] + lfe
 			out[i*2+1] = b[1] + 0.7*b[2] + 0.7*b[5] + lfe
 		}
+	case 7: // 6.1: L R C LFE Bc Ls Rs
+		for i := 0; i < frames; i++ {
+			b := in[i*7:]
+			lfe := 0.5 * b[3]
+			out[i*2] = b[0] + 0.7*b[2] + 0.7*b[4] + 0.7*b[5] + lfe
+			out[i*2+1] = b[1] + 0.7*b[2] + 0.7*b[4] + 0.7*b[6] + lfe
+		}
 	case 8: // 7.1: L R C LFE Ls Rs Lb Rb
 		for i := 0; i < frames; i++ {
 			b := in[i*8:]
@@ -294,7 +303,93 @@ func DownmixChannels(out, in []float32, frames, channels int) {
 			out[i*2] = b[0] + 0.7*b[2] + 0.7*b[4] + 0.7*b[6] + lfe
 			out[i*2+1] = b[1] + 0.7*b[2] + 0.7*b[5] + 0.7*b[7] + lfe
 		}
+	case 10: // 5.1.4: L R C LFE Ls Rs Tfl Tfr Tbl Tbr
+		for i := 0; i < frames; i++ {
+			b := in[i*10:]
+			lfe := 0.5 * b[3]
+			out[i*2] = b[0] + 0.7*b[2] + 0.7*b[4] + 0.7*b[6] + 0.7*b[8] + lfe
+			out[i*2+1] = b[1] + 0.7*b[2] + 0.7*b[5] + 0.7*b[7] + 0.7*b[9] + lfe
+		}
+	case 12: // 7.1.4: L R C LFE Ls Rs Lb Rb Tfl Tfr Tbl Tbr
+		for i := 0; i < frames; i++ {
+			b := in[i*12:]
+			lfe := 0.5 * b[3]
+			out[i*2] = b[0] + 0.7*b[2] + 0.7*b[4] + 0.7*b[6] + 0.7*b[8] + 0.7*b[10] + lfe
+			out[i*2+1] = b[1] + 0.7*b[2] + 0.7*b[5] + 0.7*b[7] + 0.7*b[9] + 0.7*b[11] + lfe
+		}
 	default:
 		DownmixToStereo(out, in, frames, channels)
 	}
+}
+
+// MapChannels converts an interleaved buffer from inCh to outCh channels.
+// It is the single adaptation point between the decoder (which keeps the
+// source layout) and the output endpoint (which may only accept stereo):
+//   - same layout: straight copy
+//   - multichannel -> stereo: film-style downmix (DownmixChannels)
+//   - stereo -> mono: average
+//   - mono -> stereo/multichannel: duplicate into the front pair, rest silent
+//   - other layouts: copy the shared channels, zero the tail
+//
+// Values are clamped to [-1, 1] after a downmix so a hot surround mix cannot
+// wrap when the sink converts float to integer.
+func MapChannels(out, in []float32, frames, inCh, outCh int) {
+	if frames <= 0 || inCh <= 0 || outCh <= 0 {
+		return
+	}
+	if inCh == outCh {
+		copy(out[:frames*outCh], in[:frames*outCh])
+		return
+	}
+	switch {
+	case outCh == 2 && inCh > 2:
+		DownmixChannels(out, in, frames, inCh)
+		for i := 0; i < frames*2; i++ {
+			out[i] = clampF32(out[i])
+		}
+	case outCh == 1:
+		for i := 0; i < frames; i++ {
+			sum := float32(0)
+			for c := 0; c < inCh; c++ {
+				sum += in[i*inCh+c]
+			}
+			out[i] = sum / float32(inCh)
+		}
+	case inCh == 1:
+		for i := 0; i < frames; i++ {
+			v := in[i]
+			base := i * outCh
+			for c := 0; c < outCh; c++ {
+				out[base+c] = 0
+			}
+			out[base] = v
+			if outCh > 1 {
+				out[base+1] = v
+			}
+		}
+	default:
+		// Stereo -> multichannel (or an unexpected pair): keep the front pair
+		// and silence the rest, so a stereo track still plays on a 5.1/7.1 sink.
+		for i := 0; i < frames; i++ {
+			src := i * inCh
+			dst := i * outCh
+			for c := 0; c < outCh; c++ {
+				if c < inCh {
+					out[dst+c] = in[src+c]
+				} else {
+					out[dst+c] = 0
+				}
+			}
+		}
+	}
+}
+
+func clampF32(v float32) float32 {
+	if v > 1 {
+		return 1
+	}
+	if v < -1 {
+		return -1
+	}
+	return v
 }

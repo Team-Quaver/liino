@@ -244,7 +244,7 @@ func TestStaleGenerationCannotPlayOldTrack(t *testing.T) {
 	if snap := p.Snapshot(); snap.State != StatePlaying && snap.State != StateBuffering {
 		t.Fatalf("state = %s, want playing", snap.State)
 	}
-	if got := p.pipe.Token(); got != genB {
+	if got := p.pipe.Load().Token(); got != genB {
 		t.Fatalf("pipe token = %d, want %d", got, genB)
 	}
 }
@@ -292,11 +292,11 @@ func TestPlayerVolumeAndEQ(t *testing.T) {
 	if !p.Muted() {
 		t.Fatal("mute not recorded")
 	}
-	if got := p.chain.Volume(); got != 0 {
+	if got := p.outGain.Linear(); got != 0 {
 		t.Fatalf("muted gain = %v, want 0", got)
 	}
 	p.SetMuted(false)
-	if got := p.chain.Volume(); got != 0.5 {
+	if got := p.outGain.Linear(); got != 0.5 {
 		t.Fatalf("unmuted gain = %v, want 0.5", got)
 	}
 	if err := p.SetEQ([]dsp.Config{{Freq: 1000, Q: 1, Gain: 6}}); err != nil {
@@ -307,6 +307,104 @@ func TestPlayerVolumeAndEQ(t *testing.T) {
 	}
 	if st := p.DSPState(); len(st.Bands) != 1 || st.Channels != pcm.DefaultChannels {
 		t.Fatalf("dsp state = %+v", st)
+	}
+}
+
+// The host sets volume before Open (saved preference / transport swap). The
+// async decodeLoop then derives the DSP format; the gain target must survive.
+func TestPlayerVolumeSurvivesLoad(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	p.SetVolume(0.25)
+	events, cancel := p.Events(64)
+	defer cancel()
+	ctx, stop := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stop()
+	if err := p.Open(ctx, decode.Source{URI: "synthetic"}, OpenOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StateReady, 2*time.Second)
+	if got := p.outGain.Linear(); math.Abs(got-0.25) > 1e-6 {
+		t.Fatalf("output volume after load = %v, want 0.25", got)
+	}
+}
+
+// A 12-channel source feeding a stereo endpoint must be folded in Read, not
+// rejected by the decoder. This also covers the source-layout pipe swap.
+func TestPlayerReadFoldsToEndpointChannels(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	pipe := pcm.NewPipe(4800, pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: 12})
+	pipe.Swap(0)
+	p.pipe.Store(pipe)
+	p.outChannels.Store(pcm.DefaultChannels)
+	frames := 240
+	data := make([]float32, frames*12)
+	for i := range data {
+		data[i] = 0.1
+	}
+	if _, err := pipe.WriteFrames(0, data, frames); err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]float32, frames*pcm.DefaultChannels)
+	if n := p.Read(dst); n != frames {
+		t.Fatalf("read frames = %d, want %d", n, frames)
+	}
+	var nonzero bool
+	for _, v := range dst {
+		if v > 1 || v < -1 {
+			t.Fatalf("folded sample out of range: %v", v)
+		}
+		if v != 0 {
+			nonzero = true
+		}
+	}
+	if !nonzero {
+		t.Fatal("fold produced silence")
+	}
+}
+
+// The ring can hold seconds of audio. Volume is applied after it, so a slider
+// move must affect frames that were already buffered — that is the whole point
+// of the consumer-side gain.
+func TestPlayerReadAppliesVolumeToBufferedFrames(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	pipe := pcm.NewPipe(4800, pcm.DefaultFormat())
+	pipe.Swap(0)
+	p.pipe.Store(pipe)
+	p.outChannels.Store(pcm.DefaultChannels)
+	frames := 120
+	data := make([]float32, frames*2)
+	for i := range data {
+		data[i] = 0.8
+	}
+	if _, err := pipe.WriteFrames(0, data, frames); err != nil {
+		t.Fatal(err)
+	}
+	p.SetVolume(0.25)
+	p.outGain.SetRamp(0)
+	p.outGain.Snap()
+	dst := make([]float32, frames*2)
+	if n := p.Read(dst); n != frames {
+		t.Fatalf("read frames = %d, want %d", n, frames)
+	}
+	for i, v := range dst {
+		if math.Abs(float64(v)-0.2) > 1e-5 {
+			t.Fatalf("sample %d = %v, want 0.2 (buffered frame not attenuated)", i, v)
+		}
 	}
 }
 

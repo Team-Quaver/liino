@@ -74,9 +74,17 @@ func (p *Pipeline) SetFormat(rate, channels int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if rate > 0 {
+		// Rebuilding the gain stage must keep the user's target: SetFormat runs
+		// asynchronously when a stream opens, after the host has already applied
+		// the volume slider. Resetting to unity here silently made every track
+		// start at 100% and ignored the saved volume until the next move.
+		gain := 1.0
+		if p.preamp != nil {
+			gain = p.preamp.Linear()
+		}
 		p.rate = float64(rate)
 		p.preamp = NewRampGain(p.rate)
-		p.preamp.SetLinear(1)
+		p.preamp.SetLinear(gain)
 		for _, b := range p.bands {
 			b.bq.SetRate(p.rate)
 		}

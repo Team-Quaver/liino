@@ -57,6 +57,12 @@
      nothing about the FFmpeg loaded at *run* time. It stays as a fallback for
      releases without a measured table.
    - AGPL note: this fork stays Apache-2.0, see the license section above.
+7. `frame.go`: new `FrameWrapper.SetChannelLayout(channels)` writes the default
+   `AVChannelLayout` for a channel count onto a decoder-owned frame. Opus
+   mapping family 3 (QQ Music's 7.1.4 tier) decodes 12 planes but leaves
+   `AVFrame.ch_layout` unspecified; `swr_convert_frame` then fails on the first
+   frame. Liino calls it before resampling so the data can be copied
+   channel-faithfully.
 
 ### Why
 
@@ -71,3 +77,32 @@ handle from `LoadLibraryExW` is therefore the only missing piece.
 Drop this directory and the `replace` once upstream (or a published Team-Quaver
 fork) ships a Windows-capable loader, then bump `decode/native` back to the
 upstream import path.
+
+## purego-pipewire
+
+- Upstream: <https://github.com/bnema/purego-pipewire> (tag `v0.1.6`).
+- License: MIT. The upstream `LICENCE` is kept verbatim.
+- Import path: same module path, wired through a `replace` in `go.mod`; only the
+  packages Liino compiles are copied.
+
+### Modifications
+
+1. `PlayerConfig` (public and `internal/core`) gained `AppName`, `StreamName`
+   and `MediaRole`.
+2. `StreamOps.CreatePlaybackStream` takes a `StreamProperties` value.
+3. `internal/capi` builds a `spa_dict` and calls `pw_properties_new_dict`, then
+   passes it to `pw_stream_new_simple` instead of `nil`. This is what makes the
+   OS mixer show **Quaver Music** instead of the host process name
+   (`electron`); the daemon otherwise derives `application.name` from
+   `pw_get_prgname()` (a Node `process.title` change does not reach it).
+
+### Why
+
+Upstream's player API has no way to set stream properties, and the stream's
+node/client therefore kept the default name. There is no runtime workaround
+without the stream pointer (which upstream does not expose).
+
+### Removing the fork
+
+Drop this directory and the `replace` once upstream (or a published Team-Quaver
+fork) exposes stream properties, then construct `pw.PlayerConfig` directly.

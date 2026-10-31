@@ -118,13 +118,16 @@ func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options)
 	if frames <= 0 {
 		frames = pcm.ChunkFrames
 	}
+	channels := meta.Channels
+	if channels <= 0 {
+		channels = pcm.DefaultChannels
+	}
 	return &stream{
-		dec:     dec,
-		meta:    meta,
-		sample:  meta.SampleRate,
-		chans:   meta.Channels,
-		chunk:   pcm.Chunk{Data: make([]float32, frames*2), Frames: 0, Format: pcm.DefaultFormat()},
-		staging: make([]float32, 0, frames*4),
+		dec:    dec,
+		meta:   meta,
+		sample: meta.SampleRate,
+		chans:  meta.Channels,
+		chunk:  pcm.Chunk{Data: make([]float32, frames*channels), Frames: 0, Format: pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: channels}},
 	}, nil
 }
 
@@ -140,10 +143,9 @@ type stream struct {
 	resampleTo ffgo.AudioFormat
 	resampleFrom
 
-	chunk   pcm.Chunk // returned buffer, grown on demand
-	staging []float32 // multichannel scratch before the Go downmix
-	closed  bool
-	mu      sync.Mutex
+	chunk  pcm.Chunk // returned buffer, grown on demand
+	closed bool
+	mu     sync.Mutex
 }
 
 type resampleFrom struct {
@@ -151,7 +153,7 @@ type resampleFrom struct {
 	format         ffgo.SampleFormat
 }
 
-func (s *stream) Format() pcm.Format { return pcm.DefaultFormat() }
+func (s *stream) Format() pcm.Format { return s.chunk.Format }
 func (s *stream) Meta() decode.Meta  { return s.meta }
 
 // Read returns the next decoded chunk. The buffer is owned by the stream and
@@ -196,11 +198,12 @@ func (s *stream) push(w *ffgo.FrameWrapper) (int, error) {
 	}
 	format := w.SampleFormat()
 
-	dstCh := channels
-	if dstCh > 2 {
-		dstCh = 2
-	}
-	if err := s.ensureResampler(rate, channels, format, dstCh); err != nil {
+	// Keep the source channel layout here. FFmpeg cannot rematrix layouts it
+	// does not know (7.1.4 Opus, i.e. QQ Music's "臻品全景声 7.1", reports 12
+	// channels with no layout), so asking swresample for 12 -> 2 fails inside
+	// swr_convert and the whole track is silent. The player folds channels to
+	// whatever the output endpoint accepts instead.
+	if err := s.ensureResampler(rate, channels, format, channels); err != nil {
 		return 0, err
 	}
 	// Some containers (raw streams, live inputs) probe without parameters; the
@@ -212,6 +215,11 @@ func (s *stream) push(w *ffgo.FrameWrapper) (int, error) {
 		s.meta.Channels = channels
 	}
 
+	// Opus mapping family 3 (QQ Music's 7.1.4 tier) decodes 12 planes but
+	// leaves the frame layout unspecified. swr_convert_frame reconfigures
+	// itself from the input frame and then fails on the unknown layout; give it
+	// the default layout for this channel count first.
+	w.SetChannelLayout(channels)
 	raw := w.Raw()
 	out, err := s.resample.Resample(raw)
 	if err != nil {
@@ -237,17 +245,10 @@ func (s *stream) push(w *ffgo.FrameWrapper) (int, error) {
 		return 0, nil
 	}
 
-	if s.resampleTo.Channels == 2 {
-		s.chunk.Data = ensureF32Cap(s.chunk.Data, frames*2)
-		copy(s.chunk.Data[:frames*2], data[:frames*2])
-		return frames, nil
-	}
-	// Sources with more than two channels are resampled channel-faithful and
-	// folded down here, because swresample refuses to rematrix unknown layouts.
-	s.staging = ensureF32Cap(s.staging, frames*s.resampleTo.Channels)
-	copy(s.staging[:frames*s.resampleTo.Channels], data[:frames*s.resampleTo.Channels])
-	s.chunk.Data = ensureF32Cap(s.chunk.Data, frames*2)
-	pcm.DownmixChannels(s.chunk.Data[:frames*2], s.staging[:frames*s.resampleTo.Channels], frames, s.resampleTo.Channels)
+	outCh := s.resampleTo.Channels
+	s.chunk.Data = ensureF32Cap(s.chunk.Data, frames*outCh)
+	copy(s.chunk.Data[:frames*outCh], data[:frames*outCh])
+	s.chunk.Format = pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: outCh}
 	return frames, nil
 }
 

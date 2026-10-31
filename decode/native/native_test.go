@@ -32,10 +32,12 @@ func fixture(t *testing.T, name string) string {
 }
 
 // drain decodes a whole stream and reports frame count and signal energy.
+// The decoder preserves the source channel count at 48 kHz.
 func drain(t *testing.T, s decode.Stream) (int, float64, float64) {
 	t.Helper()
 	var frames int
 	var sumL, maxAbs float64
+	var channels int
 	for {
 		c, err := s.Read()
 		if errors.Is(err, io.EOF) {
@@ -44,16 +46,22 @@ func drain(t *testing.T, s decode.Stream) (int, float64, float64) {
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if c.Format.Channels != pcm.DefaultChannels || c.Format.SampleRate != pcm.DefaultSampleRate {
-			t.Fatalf("format = %+v, want 48000/2", c.Format)
+		if c.Format.SampleRate != pcm.DefaultSampleRate || c.Format.Channels <= 0 {
+			t.Fatalf("format = %+v, want 48000 with a channel count", c.Format)
+		}
+		if channels == 0 {
+			channels = c.Format.Channels
+		} else if channels != c.Format.Channels {
+			t.Fatalf("channel count changed mid-stream: %d -> %d", channels, c.Format.Channels)
 		}
 		for i := 0; i < c.Frames; i++ {
-			l := math.Abs(float64(c.Data[i*2]))
-			r := math.Abs(float64(c.Data[i*2+1]))
-			sumL += l * l
-			if m := math.Max(l, r); m > maxAbs {
-				maxAbs = m
+			for ch := 0; ch < c.Format.Channels; ch++ {
+				v := math.Abs(float64(c.Data[i*c.Format.Channels+ch]))
+				if v > maxAbs {
+					maxAbs = v
+				}
 			}
+			sumL += math.Abs(float64(c.Data[i*c.Format.Channels])) * math.Abs(float64(c.Data[i*c.Format.Channels]))
 		}
 		frames += c.Frames
 	}
@@ -96,7 +104,10 @@ func TestDecodeMP3ResamplesToCanonical(t *testing.T) {
 	}
 }
 
-func TestDecodeMonoDownmixesToStereo(t *testing.T) {
+// The decoder keeps mono as one channel; the player duplicates it for the
+// endpoint (see pcm.MapChannels). Keeping the source shape here means a mono
+// file can still be output as mono on a mono device.
+func TestDecodeMonoKeepsLayout(t *testing.T) {
 	path := fixture(t, "tone-96000-mono.flac")
 	s, err := (backend{}).Open(context.Background(), decode.Source{URI: path}, decode.Options{})
 	if err != nil {
@@ -107,35 +118,11 @@ func TestDecodeMonoDownmixesToStereo(t *testing.T) {
 		t.Fatalf("source channels = %d, want 1", s.Meta().Channels)
 	}
 
-	var frames int
-	var mismatch int
-	var first [2]float32
-	for {
-		c, err := s.Read()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if frames == 0 {
-			first = [2]float32{c.Data[0], c.Data[1]}
-		}
-		for i := 0; i < c.Frames; i++ {
-			// A mono source must land identically on both ears.
-			if math.Abs(float64(c.Data[i*2]-c.Data[i*2+1])) > 1e-6 {
-				mismatch++
-			}
-		}
-		frames += c.Frames
-	}
+	frames, rms, peak := drain(t, s)
 	if want := 2 * pcm.DefaultSampleRate; absInt(frames-want) > pcm.DefaultSampleRate/10 {
 		t.Fatalf("frames = %d, want ~%d", frames, want)
 	}
-	if mismatch > frames/100 {
-		t.Fatalf("mono not duplicated on %d/%d frames", mismatch, frames)
-	}
-	if first[0] == 0 && first[1] == 0 {
+	if rms <= 0 || peak <= 0 {
 		t.Fatal("silent decode")
 	}
 }
@@ -164,9 +151,9 @@ func TestDecodeSeekReturnsRemainingTail(t *testing.T) {
 	}
 }
 
-// TestDecode51DownmixesToStereo covers the wide-layout path: swresample keeps
-// six channels and the Go side folds them onto stereo.
-func TestDecode51DownmixesToStereo(t *testing.T) {
+// TestDecode51KeepsLayout covers the wide-layout path: the decoder hands six
+// channels to the player, which folds them when the endpoint is stereo.
+func TestDecode51KeepsLayout(t *testing.T) {
 	path := fixture(t, "tone-48000-51.flac")
 	s, err := (backend{}).Open(context.Background(), decode.Source{URI: path}, decode.Options{})
 	if err != nil {
@@ -192,12 +179,15 @@ func TestDecode51DownmixesToStereo(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if c.Format.Channels != pcm.DefaultChannels {
-			t.Fatalf("output channels = %d, want 2", c.Format.Channels)
+		if c.Format.Channels != 6 {
+			t.Fatalf("output channels = %d, want 6 (source layout)", c.Format.Channels)
 		}
+		// The player's fold must keep both ears alive and distinct.
+		stereo := make([]float32, c.Frames*pcm.DefaultChannels)
+		pcm.MapChannels(stereo, c.Data[:c.Frames*6], c.Frames, 6, pcm.DefaultChannels)
 		for i := 0; i < c.Frames; i++ {
-			l, r := math.Abs(float64(c.Data[i*2])), math.Abs(float64(c.Data[i*2+1]))
-			if l-r > 1e-6 || r-l > 1e-6 {
+			l, r := math.Abs(float64(stereo[i*2])), math.Abs(float64(stereo[i*2+1]))
+			if math.Abs(l-r) > 1e-6 {
 				distinct++
 			}
 			sumL += l
@@ -211,10 +201,59 @@ func TestDecode51DownmixesToStereo(t *testing.T) {
 	if sumL <= 0 || sumR <= 0 {
 		t.Fatal("silent downmix")
 	}
-	// Every source channel holds a different tone, so the folded ears cannot be
-	// identical. Equal channels would mean the plane stride was misread.
 	if distinct < frames/10 {
 		t.Fatalf("downmix produced identical channels (%d/%d frames differ)", distinct, frames)
+	}
+}
+
+// TestDecode714OpusKeepsLayout is the QQ Music "臻品全景声 7.1" regression:
+// 12-channel Opus with mapping family 3 has no channel layout in AVFrame, and
+// asking swresample to rematrix it used to fail on the very first frame. The
+// decoder must hand all 12 channels through instead.
+func TestDecode714OpusKeepsLayout(t *testing.T) {
+	path := fixture(t, "tone-48000-71_4.opus")
+	s, err := (backend{}).Open(context.Background(), decode.Source{URI: path}, decode.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if got := s.Meta().Channels; got != 12 {
+		t.Fatalf("source channels = %d, want 12", got)
+	}
+	var frames int
+	var peak float32
+	var folded bool
+	for {
+		c, err := s.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Format.Channels != 12 {
+			t.Fatalf("output channels = %d, want 12", c.Format.Channels)
+		}
+		for i := 0; i < c.Frames; i++ {
+			// The player's fold must not drop the track either.
+			stereo := make([]float32, 2)
+			pcm.MapChannels(stereo, c.Data[i*12:i*12+12], 1, 12, 2)
+			for _, v := range stereo {
+				if v > 1 || v < -1 {
+					t.Fatalf("folded sample %v out of range", v)
+				}
+				if v != 0 {
+					folded = true
+				}
+				if a := float32(math.Abs(float64(v))); a > peak {
+					peak = a
+				}
+			}
+		}
+		frames += c.Frames
+	}
+	if frames <= 0 || peak <= 0 || !folded {
+		t.Fatalf("no decodable frames (frames=%d peak=%v folded=%v)", frames, peak, folded)
 	}
 }
 

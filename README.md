@@ -10,7 +10,9 @@ Liino 是 Quaver Music / Quaver Music Astra 的下一代音频后端，用纯 Go
     动态加载系统 FFmpeg（libav\*），无 CGO、无捆绑二进制。
   - `WASM`（Quaver Music）：通过 [libav.js](https://github.com/Yahweasel/libav.js)
     在 Node 侧解码，Go 侧消费 float32 PCM。
-- **PCM 管线**：统一转成 48 kHz / 立体声 / float32 交织，环形缓冲解耦。
+- **PCM 管线**：统一转成 48 kHz / float32 交织，保留源声道数（5.1、7.1、7.1.4…）；
+  输出端能承载多声道时原样送出（PipeWire 由 graph 决定是否下混），否则在播放器里
+  折成双声道。环形缓冲解耦解码与设备回调。
 - **DSP**：增益 → 效果器链（双二阶 EQ、限幅器等），纯 Go 实现。
 - **输出**：`Output` 接口 + 平台注册表。
   - Linux：PipeWire（[purego-pipewire](https://github.com/bnema/purego-pipewire)，`CGO_ENABLED=0`），

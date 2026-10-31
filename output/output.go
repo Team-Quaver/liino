@@ -395,7 +395,7 @@ func (p *Pump) Fill(dst []float32, frames int) int {
 	if frames <= 0 || len(dst) < frames*p.format.Channels {
 		return 0
 	}
-	p.scratch = ensureFrames(p.scratch, frames)
+	p.scratch = ensureFrames(p.scratch, frames, p.format.Channels)
 	n := p.src.Read(p.scratch[:frames*p.format.Channels])
 	if n > frames {
 		n = frames
@@ -424,7 +424,7 @@ func (p *Pump) FillPlanar(planar [][]float32, frames, stride int) int {
 	// the backend layout and is measured in bytes here (float32 = 4), not in
 	// float32 elements; deinterleaving must advance one sample per frame.
 	ch := minInt(p.format.Channels, len(planar))
-	p.scratch = ensureFrames(p.scratch, frames)
+	p.scratch = ensureFrames(p.scratch, frames, ch)
 	n := p.src.Read(p.scratch[:frames*ch])
 	if n > frames {
 		n = frames
@@ -466,8 +466,11 @@ func (p *Pump) Logf(format string, args ...any) {
 	}
 }
 
-func ensureFrames(b []float32, frames int) []float32 {
-	n := frames * pcm.DefaultChannels
+func ensureFrames(b []float32, frames, channels int) []float32 {
+	if channels <= 0 {
+		channels = pcm.DefaultChannels
+	}
+	n := frames * channels
 	if cap(b) >= n {
 		return b[:n]
 	}

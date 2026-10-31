@@ -153,6 +153,20 @@ func (f *FrameWrapper) Channels() int {
 	return int(avutil.GetFrameChannels(f.frame.ptr))
 }
 
+// SetChannelLayout assigns the default FFmpeg layout for the given channel
+// count to the frame. Decoders that carry channel mapping outside FFmpeg (Opus
+// mapping family 3, for example) leave AVFrame.ch_layout unspecified while
+// still exposing 12 planes; libswresample then refuses to convert. Calling
+// this before resampling gives swr a layout it can work with. It only writes
+// the inline AVChannelLayout fields (no allocation) and is safe on a
+// decoder-owned frame.
+func (f *FrameWrapper) SetChannelLayout(channels int) {
+	if f == nil || f.frame.IsNil() || channels <= 0 {
+		return
+	}
+	avutil.FrameSetChannels(f.frame.ptr, int32(channels))
+}
+
 // IsKeyFrame returns true if this is a keyframe (video only).
 func (f *FrameWrapper) IsKeyFrame() bool {
 	if f == nil || f.frame.IsNil() {

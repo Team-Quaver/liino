@@ -94,6 +94,60 @@ func TestDownmixChannels(t *testing.T) {
 	}
 }
 
+func TestMapChannels714ToStereo(t *testing.T) {
+	// 7.1.4: L R C LFE Ls Rs Lb Rb Tfl Tfr Tbl Tbr. A front-left-only signal
+	// must stay left; a top-left-only signal must also land on the left.
+	in := make([]float32, 12)
+	in[0] = 0.5
+	out := make([]float32, 2)
+	MapChannels(out, in, 1, 12, 2)
+	if out[0] != 0.5 || out[1] != 0 {
+		t.Fatalf("7.1.4 front-left = %v", out)
+	}
+	clear(in)
+	in[8] = 0.4 // top-front-left
+	MapChannels(out, in, 1, 12, 2)
+	if math.Abs(float64(out[0])-0.28) > 1e-6 || out[1] != 0 {
+		t.Fatalf("7.1.4 top-left = %v", out)
+	}
+	// The fold clamps instead of wrapping when many channels align.
+	for i := range in {
+		in[i] = 0.9
+	}
+	MapChannels(out, in, 1, 12, 2)
+	for _, v := range out {
+		if v > 1 || v < -1 {
+			t.Fatalf("folded sample out of range: %v", v)
+		}
+	}
+}
+
+func TestMapChannelsUpmixKeepsFrontPair(t *testing.T) {
+	out := make([]float32, 12)
+	MapChannels(out, []float32{0.3, -0.3}, 1, 2, 12)
+	if out[0] != 0.3 || out[1] != -0.3 {
+		t.Fatalf("front pair = %v", out[:2])
+	}
+	for _, v := range out[2:] {
+		if v != 0 {
+			t.Fatalf("non-front channel not silent: %v", out[2:])
+		}
+	}
+}
+
+func TestMapChannelsMonoToMultichannel(t *testing.T) {
+	out := make([]float32, 6)
+	MapChannels(out, []float32{0.4}, 1, 1, 6)
+	if out[0] != 0.4 || out[1] != 0.4 {
+		t.Fatalf("mono front pair = %v", out[:2])
+	}
+	for _, v := range out[2:] {
+		if v != 0 {
+			t.Fatalf("mono tail not silent: %v", out[2:])
+		}
+	}
+}
+
 func TestStereoCopyIsExact(t *testing.T) {
 	in := []float32{0.25, -0.25, 0.5, -0.5}
 	out := make([]float32, 4)

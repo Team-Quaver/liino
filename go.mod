@@ -16,3 +16,8 @@ require (
 // purego.Dlopen, which does not exist on Windows, so the bindings could not
 // even compile there. See third_party/VENDORED.md.
 replace github.com/team-quaver/ffgo => ./third_party/ffgo
+
+// purego-pipewire does not expose stream/app properties, so the OS mixer shows
+// the Electron process ("electron") instead of Quaver Music. The local fork
+// passes application.name/media.name/node.name through pw_stream_new_simple.
+replace github.com/bnema/purego-pipewire => ./third_party/purego-pipewire

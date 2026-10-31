@@ -15,16 +15,67 @@ import (
 
 // Read implements output.Source: the device callback drains the pipe and never
 // takes the player lock, so a slow API call cannot starve the audio thread.
+//
+// The pipe carries the decoded source layout (5.1, 7.1, 7.1.4, ...). When the
+// endpoint was opened for a different channel count — most commonly a stereo
+// sink — this is where the fold happens, not in the decoder: swresample cannot
+// rematrix layouts it does not know, and dropping channels there made 12-channel
+// Opus ("臻品全景声 7.1") produce literally zero frames.
 func (p *Player) Read(dst []float32) int {
-	n := p.pipe.Read(dst)
-	if n > 0 {
-		p.pulled.Add(uint64(n))
+	pipe := p.pipe.Load()
+	inCh := pipe.Format().Channels
+	outCh := int(p.outChannels.Load())
+	if outCh <= 0 {
+		outCh = pcm.DefaultChannels
 	}
+	if inCh == outCh {
+		n := pipe.Read(dst)
+		if n > 0 {
+			p.outGain.Process(dst[:n*outCh], outCh)
+			p.pulled.Add(uint64(n))
+		}
+		return n
+	}
+	frames := len(dst) / outCh
+	if frames <= 0 {
+		return 0
+	}
+	need := frames * inCh
+	if cap(p.readBuf) < need {
+		p.readBuf = make([]float32, need)
+	}
+	buf := p.readBuf[:need]
+	n := pipe.Read(buf)
+	if n <= 0 {
+		return 0
+	}
+	pcm.MapChannels(dst[:n*outCh], buf[:n*inCh], n, inCh, outCh)
+	p.outGain.Process(dst[:n*outCh], outCh)
+	p.pulled.Add(uint64(n))
 	return n
 }
 
 // Reset implements output.Source.
 func (p *Player) Reset() { p.pulled.Store(0) }
+
+// ensurePipe makes the pipe carry the given channel count. The callback may
+// still be draining the old pipe; the pointer swap is atomic and the old pipe
+// is interrupted so a producer blocked on it wakes up.
+func (p *Player) ensurePipe(gen uint64, channels int) {
+	if channels <= 0 {
+		channels = pcm.DefaultChannels
+	}
+	cur := p.pipe.Load()
+	if cur != nil && cur.Format().Channels == channels {
+		return
+	}
+	next := pcm.NewPipe(p.cfg.RingFrames, pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: channels})
+	next.Swap(gen)
+	p.pipe.Store(next)
+	if cur != nil {
+		cur.Interrupt()
+	}
+}
 
 // decodeLoop owns one decoder session: it opens the source, runs the DSP chain
 // over the decoded PCM and feeds the pipe until the generation is superseded.
@@ -56,9 +107,21 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 	p.stream = stream
 	p.decoderName = backend.Name()
 	p.meta = stream.Meta()
-	if p.meta.SampleRate > 0 {
-		p.chain.SetFormat(pcm.DefaultSampleRate, pcm.DefaultChannels)
+	// The pipe must match what the decoder actually emits. That is the stream's
+	// Format() (canonical 48 kHz + source channels for native, stereo for the
+	// wasm helper), not the container's Meta().
+	srcCh := stream.Format().Channels
+	if srcCh <= 0 {
+		srcCh = p.meta.Channels
 	}
+	if srcCh <= 0 {
+		srcCh = pcm.DefaultChannels
+	}
+	p.chain.SetFormat(pcm.DefaultSampleRate, srcCh)
+	// The decoder keeps the source layout. Swap the pipe if this track's
+	// channel count differs from the previous one; Read folds it for the
+	// endpoint when necessary (see Read).
+	p.ensurePipe(gen, srcCh)
 	seekable := p.meta.Seekable
 	p.mu.Unlock()
 
@@ -84,7 +147,7 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 	p.logf("loaded %s via %s (%s, %d Hz %d ch, %s)", src.Label(), backend.Name(),
 		p.meta.Codec, p.meta.SampleRate, p.meta.Channels, p.meta.Duration)
 
-	buf := make([]float32, 0, pcm.ChunkFrames*pcm.DefaultChannels)
+	buf := make([]float32, 0, pcm.ChunkFrames*srcCh)
 	for {
 		// Seeks are executed here: the decoder context is single-goroutine.
 		if err := p.applyPendingSeek(gen, stream); err != nil {
@@ -116,10 +179,16 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 		if ch <= 0 {
 			ch = pcm.DefaultChannels
 		}
+		// Raw/live sources sometimes only reveal their layout on the first
+		// decoded frame. Keep the pipe and DSP in sync when that happens.
+		if p.pipe.Load().Format().Channels != ch {
+			p.ensurePipe(gen, ch)
+			p.chain.SetFormat(pcm.DefaultSampleRate, ch)
+		}
 		n := chunk.Frames * ch
 		buf = append(buf[:0], chunk.Data[:n]...)
 		p.chain.Process(buf, ch)
-		if _, err := p.pipe.WriteFrames(gen, buf, chunk.Frames); err != nil {
+		if _, err := p.pipe.Load().WriteFrames(gen, buf, chunk.Frames); err != nil {
 			switch {
 			case p.stale(gen), errors.Is(err, pcm.ErrPipeStale), errors.Is(err, pcm.ErrPipeClosed):
 				return
@@ -173,7 +242,7 @@ func (p *Player) applyPendingSeek(gen uint64, stream decode.Stream) error {
 		}
 		return fmt.Errorf("seek: %w", err)
 	}
-	p.pipe.Reset()
+	p.pipe.Load().Reset()
 	p.nudge()
 	p.logf("seeked to %s", target)
 	return nil
@@ -220,7 +289,7 @@ func (p *Player) markEOF(gen uint64) {
 	p.mu.Lock()
 	p.eof = true
 	p.mu.Unlock()
-	p.pipe.Close()
+	p.pipe.Load().Close()
 	p.nudge()
 	p.logf("decoder reached end of stream")
 }
@@ -253,12 +322,32 @@ func (p *Player) ensureOutput(deviceID string) error {
 		return ErrClosed
 	}
 	driverName := p.cfg.Driver
+	periodFrames := p.cfg.PeriodFrames
+	appName := p.cfg.AppName
+	streamName := p.cfg.StreamName
+	logf := p.cfg.Log
+	// Negotiate against what the decoder actually feeds the pipe, not the
+	// container metadata (wasm downmixes, native preserves).
+	sourceCh := p.pipe.Load().Format().Channels
+	if sourceCh <= 0 {
+		sourceCh = p.meta.Channels
+	}
+	p.mu.Unlock()
+
+	// Device enumeration can be slow (WASAPI/Core Audio); do it after releasing
+	// p.mu so FFI calls from the main thread never wait on it.
+	if driverName == "" {
+		if d, err := output.Default(); err == nil {
+			driverName = d.Name()
+		}
+	}
+	outCh := outputChannelPlan(driverName, deviceID, sourceCh)
 	opts := output.Options{
 		DeviceID:     deviceID,
-		Format:       pcm.DefaultFormat(),
-		PeriodFrames: p.cfg.PeriodFrames,
-		AppName:      p.cfg.AppName,
-		StreamName:   p.cfg.StreamName,
+		Format:       pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: outCh},
+		PeriodFrames: periodFrames,
+		AppName:      appName,
+		StreamName:   streamName,
 		Source:       p,
 		OnUnderrun:   func(int) { p.onUnderrun() },
 		OnError: func(err error) {
@@ -266,11 +355,19 @@ func (p *Player) ensureOutput(deviceID string) error {
 				p.fail(err)
 			}
 		},
-		Log: p.cfg.Log,
+		Log: logf,
 	}
-	p.mu.Unlock()
 
 	out, driver, err := output.Open(driverName, opts)
+	if err != nil && outCh > pcm.DefaultChannels {
+		// Shared-mode endpoints on Windows/macOS are fixed to their mix format;
+		// asking for 12 channels there can fail outright. Keep the track (the
+		// decoder still has all channels) and fold it to stereo instead.
+		p.logf("output open at %d ch failed (%v); retrying stereo", outCh, err)
+		outCh = pcm.DefaultChannels
+		opts.Format.Channels = outCh
+		out, driver, err = output.Open(driverName, opts)
+	}
 	if err != nil {
 		return err
 	}
@@ -305,10 +402,60 @@ func (p *Player) ensureOutput(deviceID string) error {
 	p.driver = driver
 	p.cfg.Driver = driver.Name()
 	p.device = dev
+	p.outChannels.Store(int32(outCh))
 	p.mu.Unlock()
 
 	p.logf("output %s opened on %q (latency %s)", driver.Name(), dev.Name, out.Latency())
 	return nil
+}
+
+// outputChannelPlan picks the channel count for a new endpoint. Multichannel
+// sources are kept intact when the backend can carry them; otherwise the
+// player folds them to stereo in Read (never in the decoder — swresample
+// cannot rematrix unknown layouts such as 7.1.4 Opus).
+func outputChannelPlan(driverName, deviceID string, sourceCh int) int {
+	if sourceCh <= pcm.DefaultChannels {
+		return pcm.DefaultChannels
+	}
+	switch driverName {
+	case "pipewire":
+		// The stream node can advertise the source layout and PipeWire inserts
+		// a channelmixer when the sink is stereo, so keep all channels.
+		return sourceCh
+	case "null":
+		return pcm.DefaultChannels
+	}
+	d, ok := output.Lookup(driverName)
+	if !ok {
+		return pcm.DefaultChannels
+	}
+	devs, err := d.Devices()
+	if err != nil {
+		return pcm.DefaultChannels
+	}
+	target := output.Device{}
+	for _, dev := range devs {
+		if deviceID != "" && dev.ID == deviceID {
+			target = dev
+			break
+		}
+		if target.ID == "" && dev.Default {
+			target = dev
+		}
+	}
+	if target.ID == "" && len(devs) > 0 {
+		target = devs[0]
+	}
+	maxCh := 0
+	for _, f := range target.Formats {
+		if f.Channels > maxCh {
+			maxCh = f.Channels
+		}
+	}
+	if maxCh >= sourceCh {
+		return sourceCh
+	}
+	return pcm.DefaultChannels
 }
 
 // startDevice primes the output and reports the transition.
@@ -383,7 +530,7 @@ func (p *Player) evaluate() {
 		return
 	}
 
-	avail := p.pipe.Available()
+	avail := p.pipe.Load().Available()
 	switch p.state {
 	case StateLoading, StateReady:
 		if p.wantPlay && (avail >= p.cfg.PrerollFrames || p.eof) {
@@ -497,8 +644,8 @@ func (p *Player) checkDevice() {
 	p.wantPlay = state == StatePlaying || state == StateBuffering
 	p.state = StateReady
 	p.mu.Unlock()
-	p.pipe.Reset()
-	p.pipe.Interrupt()
+	p.pipe.Load().Reset()
+	p.pipe.Load().Interrupt()
 	if p.wantPlay {
 		p.nudge()
 	}
@@ -518,10 +665,10 @@ func (p *Player) snapshotLocked() Snapshot {
 		Decoder:       p.decoderName,
 		Codec:         p.meta.Codec,
 		SampleRate:    pcm.DefaultSampleRate,
-		Channels:      pcm.DefaultChannels,
+		Channels:      snapshotChannels(p.meta.Channels),
 		Live:          p.meta.Live,
 		FramesWritten: p.pulled.Load(),
-		Drops:         p.pipe.Dropped(),
+		Drops:         p.pipe.Load().Dropped(),
 	}
 	if p.out != nil {
 		snap.Driver = p.out.Device().Driver
@@ -541,6 +688,16 @@ func (p *Player) snapshotLocked() Snapshot {
 	return snap
 }
 
+// snapshotChannels keeps the reported layout honest: the decoder preserves the
+// source count, so a 12-channel Opus reports 12 even when Read folds it to a
+// 2-channel endpoint.
+func snapshotChannels(n int) int {
+	if n <= 0 {
+		return pcm.DefaultChannels
+	}
+	return n
+}
+
 func dbOf(v float64) float64 {
 	if v <= 0 {
 		return -120
@@ -554,6 +711,6 @@ func dbOf(v float64) float64 {
 
 // bufferedLocked converts the pipe occupancy into a duration.
 func (p *Player) bufferedLocked() time.Duration {
-	frames := float64(p.pipe.Available())
+	frames := float64(p.pipe.Load().Available())
 	return time.Duration(frames / float64(pcm.DefaultSampleRate) * float64(time.Second))
 }

@@ -1,6 +1,9 @@
 package dsp
 
-import "math"
+import (
+	"math"
+	"sync/atomic"
+)
 
 // RampGain is a click-free gain stage: every change is ramped over a short
 // window instead of being applied instantly, which is what an interactive
@@ -111,4 +114,101 @@ func maxF(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// AtomicGain is the consumer-side master gain. Unlike RampGain it is safe to
+// retarget from any goroutine (SetLinear is an atomic store), while Process
+// runs on the audio callback. Liino uses it after the jitter ring rather than
+// in the decode path: the ring can hold seconds of audio, and applying the
+// volume before the ring made slider moves inaudible until the buffer drained.
+type AtomicGain struct {
+	target   atomic.Uint64 // math.Float64bits(target gain)
+	gain     float64       // audio-thread only
+	rate     float64
+	rampSecs float64
+}
+
+// NewAtomicGain creates a unity gain stage with a 20 ms ramp.
+func NewAtomicGain(rate int) *AtomicGain {
+	if rate <= 0 {
+		rate = 48000
+	}
+	g := &AtomicGain{rate: float64(rate), rampSecs: 0.02, gain: 1}
+	g.target.Store(math.Float64bits(1))
+	return g
+}
+
+// SetLinear moves the target gain (0 = silence, 1 = unity, >1 headroom).
+// Safe to call from the UI/FFI thread.
+func (g *AtomicGain) SetLinear(v float64) {
+	if v < 0 {
+		v = 0
+	}
+	g.target.Store(math.Float64bits(v))
+}
+
+// Linear reports the target gain, not the currently ramping value.
+func (g *AtomicGain) Linear() float64 {
+	return math.Float64frombits(g.target.Load())
+}
+
+// SetRamp changes how long a gain move takes.
+func (g *AtomicGain) SetRamp(ms float64) {
+	if ms < 0 {
+		ms = 0
+	}
+	g.rampSecs = ms / 1000
+}
+
+// Snap sets the current gain to the target without ramping. Call it before the
+// first audio callback (or from the audio thread).
+func (g *AtomicGain) Snap() { g.gain = g.Linear() }
+
+// Process applies the ramp in place. Gain is shared across channels, so the
+// ramp advances once per frame.
+func (g *AtomicGain) Process(data []float32, channels int) {
+	if len(data) == 0 {
+		return
+	}
+	if g.rate <= 0 {
+		g.rate = 48000
+	}
+	if channels <= 0 {
+		channels = 2
+	}
+	tgt := g.Linear()
+	cur := g.gain
+	if cur == tgt {
+		if cur == 1 {
+			return
+		}
+		scale := float32(cur)
+		for i := range data {
+			data[i] *= scale
+		}
+		return
+	}
+	span := maxF(g.rampSecs*g.rate, 1)
+	stepPerFrame := (tgt - cur) / span
+	frames := len(data) / channels
+	for f := 0; f < frames; f++ {
+		cur += stepPerFrame
+		if (stepPerFrame > 0 && cur >= tgt) || (stepPerFrame <= 0 && cur <= tgt) {
+			cur = tgt
+		}
+		base := f * channels
+		for c := 0; c < channels; c++ {
+			if base+c < len(data) {
+				data[base+c] *= float32(cur)
+			}
+		}
+		if cur == tgt {
+			scale := float32(cur)
+			for i := base + channels; i < len(data); i++ {
+				data[i] *= scale
+			}
+			break
+		}
+	}
+	g.gain = cur
 }

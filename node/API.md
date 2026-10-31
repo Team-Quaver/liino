@@ -42,8 +42,9 @@ player.close();
   `stream_name`, `ring_seconds`, `preroll_ms`, `period_ms`, `fade_out_ms`,
   `volume`, `limiter`, `limiter_db`, `eq`.
 - `snapshot()` returns `{ state, position_ms, duration_ms, buffered_ms,
-  volume, muted, driver, device, decoder, codec, underruns, clips,
-  peak_l_db, peak_r_db, live }`.
+  volume, muted, driver, device, decoder, codec, sample_rate, channels,
+  underruns, clips, peak_l_db, peak_r_db, live }`. `channels` is the source
+  layout (a 7.1.4 Opus reports 12) even when the endpoint only accepts stereo.
 - `clock()` returns a point-in-time high-precision reading:
   `{ position_ms, buffer_pos_ms, latency_ms, latency_ns, monotonic_ns,
   frames, sample_rate }`. `position_ms` subtracts the output latency from

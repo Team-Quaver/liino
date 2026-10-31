@@ -70,6 +70,22 @@ func TestLimiterClips(t *testing.T) {
 	}
 }
 
+// SetFormat runs asynchronously when a stream opens, after the host has
+// already pushed the volume slider. Rebuilding the gain stage must not snap
+// the target back to unity — that made every track start at 100%.
+func TestSetFormatKeepsVolume(t *testing.T) {
+	p := NewPipeline(48000, 2)
+	p.SetVolume(0.25)
+	p.SetFormat(48000, 6)
+	if got := p.Volume(); math.Abs(got-0.25) > 1e-6 {
+		t.Fatalf("volume after SetFormat = %v, want 0.25", got)
+	}
+	p.SetFormat(44100, 2)
+	if got := p.Volume(); math.Abs(got-0.25) > 1e-6 {
+		t.Fatalf("volume after second SetFormat = %v, want 0.25", got)
+	}
+}
+
 func TestChainOrder(t *testing.T) {
 	var order []string
 	mk := func(name string) Processor {
