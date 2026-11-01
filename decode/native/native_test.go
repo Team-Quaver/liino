@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -377,4 +379,83 @@ func absInt(v int) int {
 		return -v
 	}
 	return v
+}
+
+// TestDecodeByteSeekOverHTTP covers the network seek fast path: seeking a
+// remote source must land on the requested position without FFmpeg's
+// timestamp binary search (which is one Range round trip per probe).
+func TestDecodeByteSeekOverHTTP(t *testing.T) {
+	path := fixture(t, "tone-48000-51.flac")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ServeContent implements Range/206 semantics, matching the host relay.
+		http.ServeContent(w, r, "tone.flac", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+
+	s, err := (backend{}).Open(context.Background(), decode.Source{URI: srv.URL + "/stream/token"}, decode.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ns, ok := s.(*stream)
+	if !ok {
+		t.Fatalf("stream type = %T", s)
+	}
+	if !ns.byteSeek {
+		t.Fatal("byte seek path not enabled for an http FLAC source")
+	}
+	// Seek to the very start first (clicking the first lyric line is a byte
+	// offset of 0), then part-way in and verify the decoded tail length.
+	if _, err := s.Seek(0); err != nil {
+		t.Fatal(err)
+	}
+	full, _, _ := drain(t, s)
+	if want := 2 * pcm.DefaultSampleRate; absInt(full-want) > pcm.DefaultSampleRate/3 {
+		t.Fatalf("full frames = %d, want ~%d", full, want)
+	}
+	if _, err := s.Seek(1500 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	frames, _, _ := drain(t, s)
+	// The fixture is 2 s long: seeking to 1.5 s leaves ~0.5 s of audio.
+	want := int(0.5 * pcm.DefaultSampleRate)
+	if diff := absInt(frames - want); diff > pcm.DefaultSampleRate/3 {
+		t.Fatalf("tail frames = %d, want ~%d", frames, want)
+	}
+}
+
+// TestDecodeByteSeekSkipsMP3 guards the demuxer list: MP3 has no absolute
+// timestamps after a byte seek, and falling back to a timestamp seek on that
+// demuxer state landed the decoder near EOF instead of the target.
+func TestDecodeByteSeekSkipsMP3(t *testing.T) {
+	path := fixture(t, "tone-44100-stereo.mp3")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "tone.mp3", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+
+	s, err := (backend{}).Open(context.Background(), decode.Source{URI: srv.URL + "/stream/token"}, decode.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if ns, ok := s.(*stream); !ok || ns.byteSeek {
+		t.Fatal("byte seek must not be enabled for an MP3 source")
+	}
+	if _, err := s.Seek(1500 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	frames, _, _ := drain(t, s)
+	want := int(1.5 * pcm.DefaultSampleRate)
+	if diff := absInt(frames - want); diff > pcm.DefaultSampleRate/3 {
+		t.Fatalf("tail frames = %d, want ~%d", frames, want)
+	}
 }

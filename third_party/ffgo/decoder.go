@@ -359,6 +359,15 @@ func (d *Decoder) HasAudio() bool {
 	return d.audioStreamIdx >= 0
 }
 
+// InputFormatName returns the short name of the demuxer selected for the
+// source ("flac", "mp3", "mov,mp4,m4a,3gp,3g2,mj2", ...).
+func (d *Decoder) InputFormatName() string {
+	if d.formatCtx == nil {
+		return ""
+	}
+	return avformat.InputFormatName(avformat.GetInputFormat(d.formatCtx))
+}
+
 // NumStreams returns the total number of streams.
 func (d *Decoder) NumStreams() int {
 	if d.formatCtx == nil {
@@ -838,6 +847,31 @@ func (d *Decoder) SeekTimestamp(timestamp int64) error {
 // Deprecated: Use Seek instead.
 func (d *Decoder) SeekTime(dur time.Duration) error {
 	return d.Seek(dur)
+}
+
+// SeekByte seeks to an absolute byte offset in the source. Some demuxers
+// support this even when their timestamp seek is a binary search over the
+// source (FLAC without a SEEKTABLE, for example).
+func (d *Decoder) SeekByte(offset int64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.closed {
+		return errors.New("ffgo: decoder is closed")
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if err := avformat.SeekFrame(d.formatCtx, -1, offset, avformat.SeekFlagByte|avformat.SeekFlagBackward); err != nil {
+		return err
+	}
+	if d.videoCodecCtx != nil {
+		avcodec.FlushBuffers(d.videoCodecCtx)
+	}
+	if d.audioCodecCtx != nil {
+		avcodec.FlushBuffers(d.audioCodecCtx)
+	}
+	return nil
 }
 
 // Close releases all resources.

@@ -179,11 +179,23 @@ func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options)
 	if channels <= 0 {
 		channels = pcm.DefaultChannels
 	}
+	// Network sources pay a full Range round trip per probe of FFmpeg's
+	// timestamp binary search. Estimate the byte offset from the average
+	// bitrate instead (one seek) and let Seek decode forward to the exact PTS.
+	byteRate := int64(0)
+	if !src.IsStream() && hasScheme(src.URI) && !strings.HasPrefix(src.URI, "file://") && !src.IsLive() &&
+		meta.BitRate > 0 && demuxerKeepsAbsolutePTS(dec.InputFormatName()) {
+		byteRate = meta.BitRate / 8
+	}
 	return &stream{
 		dec:      dec,
 		meta:     meta,
 		log:      opts.Log,
 		fastSeek: fastSeek,
+		byteSeek: byteRate > 0,
+		byteRate: byteRate,
+		ptsNum:   info.TimeBase.Num,
+		ptsDen:   info.TimeBase.Den,
 		sample:   meta.SampleRate,
 		chans:    meta.Channels,
 		chunk:    pcm.Chunk{Data: make([]float32, frames*channels), Frames: 0, Format: pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: channels}},
@@ -200,6 +212,16 @@ type stream struct {
 	// and AVFMT_FLAG_FAST_SEEK was enabled. Seeks then land on the nearest
 	// index point, so Seek decodes forward to the requested time.
 	fastSeek bool
+	// byteSeek is set for network sources: Seek jumps to an estimated byte
+	// offset (one Range request) instead of FFmpeg's timestamp binary search,
+	// which costs one round trip per probe. byteRate is the average bitrate in
+	// bytes per second used for that estimate.
+	byteSeek bool
+	byteRate int64
+	// ptsNum/ptsDen are the demuxer's stream time base: packet PTS are in these
+	// units (MP3 uses 1/14112000, not samples), so seeking compares real time.
+	ptsNum int32
+	ptsDen int32
 	// pending is the first frame decoded while discarding after a fast seek.
 	// It belongs to the decoder and is consumed before the next DecodeAudio.
 	pending ffgo.Frame
@@ -412,6 +434,13 @@ func (s *stream) Seek(t time.Duration) (time.Duration, error) {
 	if t < 0 {
 		t = 0
 	}
+	if s.byteSeek && s.byteRate > 0 {
+		if err := s.seekByByte(t); err == nil {
+			return t, nil
+		}
+		// The estimate missed (or the demuxer cannot byte-seek): fall back to
+		// the accurate timestamp search on the same decoder context.
+	}
 	if err := s.dec.Seek(t); err != nil {
 		return 0, err
 	}
@@ -437,15 +466,113 @@ func (s *stream) Seek(t time.Duration) (time.Duration, error) {
 // frames covers ~47 s at 44.1 kHz, far beyond any sane index gap.
 const maxDiscardFrames = 512
 
-// discardBefore decodes and drops frames whose PTS is before t, keeping the
-// first frame at/after t for the next Read. FLAC frame PTS are absolute sample
-// numbers in the stream's sample rate.
-func (s *stream) discardBefore(t time.Duration) error {
-	rate := s.sample
-	if rate <= 0 {
-		return nil
+// Byte-seek landing windows. Overshoot cannot be fixed by decoding (audio
+// only moves forward), so a landing past the target is only accepted when it
+// is imperceptibly late. Undershoot is covered by decoding forward, bounded by
+// a budget so a wrong estimate (VBR) falls back instead of grinding through
+// tens of seconds of audio.
+const (
+	byteSeekOvershoot = 500 * time.Millisecond
+	byteSeekForward   = 5 * time.Second
+)
+
+// demuxerKeepsAbsolutePTS reports whether a demuxer can still label packets
+// with their real position after AVSEEK_FLAG_BYTE. FLAC stores the sample
+// number in every frame header, and MP4 reads its sample table, so both stay
+// absolute. MP3 has neither: the demuxer restarts its counters at the byte
+// offset, so a byte seek there is unverifiable and not worth the risk.
+func demuxerKeepsAbsolutePTS(name string) bool {
+	return name == "flac" || strings.HasPrefix(name, "mov,") || name == "mov" || name == "mp4"
+}
+
+// seekByByte repositions by an estimated absolute byte offset. Network
+// demuxers otherwise run FFmpeg's timestamp binary search, whose cost is one
+// Range round trip per probe (~log2(file size)); on a remote CDN that is what
+// made a lyric click take seconds. A byte jump is one request, and the exact
+// PTS is reached by decoding forward the short remaining gap.
+func (s *stream) seekByByte(t time.Duration) error {
+	off := int64(t.Seconds() * float64(s.byteRate))
+	if off < 0 {
+		off = 0
 	}
-	target := int64(t.Seconds() * float64(rate))
+	if err := s.dec.SeekByte(off); err != nil {
+		return err
+	}
+	// Same resampler/decoder hygiene as the timestamp path.
+	if s.resample != nil {
+		_ = s.resample.Close()
+		s.resample = nil
+	}
+	s.dec.FlushDecoder()
+	s.pending, s.hasPend = ffgo.Frame{}, false
+	return s.discardTo(t)
+}
+
+// discardTo decodes forward from a byte seek until the frame at/after t, and
+// reports whether that landing is trustworthy. Any doubt (no timestamps, a
+// large miss, EOF before the target) returns an error so the caller can fall
+// back to the demuxer's accurate search instead of playing the wrong audio.
+func (s *stream) discardTo(t time.Duration) error {
+	target := t.Seconds()
+	overshoot := byteSeekOvershoot.Seconds()
+	forward := byteSeekForward.Seconds()
+	first := -1.0
+	for i := 0; i < maxDiscardFrames; i++ {
+		frame, err := s.dec.DecodeAudio()
+		if err != nil {
+			if errors.Is(err, io.EOF) || ffgo.IsEOF(err) {
+				return errors.New("decode native: byte seek ran past end of stream")
+			}
+			if avutil.IsInvalidData(err) {
+				continue // a byte offset can land mid-frame; resync forward
+			}
+			return err
+		}
+		if frame.IsNil() {
+			return errors.New("decode native: byte seek decoded no frame")
+		}
+		w := ffgo.WrapFrame(frame, ffgo.MediaTypeAudio)
+		pts := w.PTS()
+		if pts == avutil.AV_NOPTS_VALUE {
+			return errors.New("decode native: byte seek frame has no timestamp")
+		}
+		pos := s.ptsSeconds(pts)
+		if first < 0 {
+			first = pos
+		}
+		if pos >= target {
+			if pos-target > overshoot {
+				return fmt.Errorf("decode native: byte seek overshot by %.3fs", pos-target)
+			}
+			s.pending, s.hasPend = frame, true
+			return nil
+		}
+		if pos-first > forward {
+			// Decoded further than the budget without reaching the target: the
+			// bitrate estimate is wrong for this source; use the accurate path.
+			return fmt.Errorf("decode native: byte seek still %.3fs short", target-pos)
+		}
+	}
+	return errors.New("decode native: byte seek did not reach the target")
+}
+
+// ptsSeconds converts a demuxer PTS to seconds. Packet timestamps are in the
+// stream's time base, which is not always the sample rate (MP3 uses
+// 1/14112000). Falling back to the sample rate keeps old fixtures working.
+func (s *stream) ptsSeconds(pts int64) float64 {
+	if s.ptsDen > 0 {
+		return float64(pts) * float64(s.ptsNum) / float64(s.ptsDen)
+	}
+	if s.sample > 0 {
+		return float64(pts) / float64(s.sample)
+	}
+	return 0
+}
+
+// discardBefore decodes and drops frames whose PTS is before t, keeping the
+// first frame at/after t for the next Read.
+func (s *stream) discardBefore(t time.Duration) error {
+	target := t.Seconds()
 	for i := 0; i < maxDiscardFrames; i++ {
 		frame, err := s.dec.DecodeAudio()
 		if err != nil {
@@ -468,7 +595,7 @@ func (s *stream) discardBefore(t time.Duration) error {
 			s.pending, s.hasPend = frame, true
 			return nil
 		}
-		if pts >= target {
+		if s.ptsSeconds(pts) >= target {
 			s.pending, s.hasPend = frame, true
 			return nil
 		}
