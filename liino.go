@@ -184,16 +184,23 @@ type Player struct {
 	eof         bool
 	wantPlay    bool
 	primed      bool
-	pending     func() // deferred action after a fade, e.g. stop
-	volume      float64
-	muted       bool
+	// seekRebuilds is the remaining decoder-rebuild budget for failed seeks in
+	// the current load (see rebuildAfterSeek / takeSeekRebuild).
+	seekRebuilds int
+	// loopAlive reports whether a decode goroutine owns this generation. A
+	// seek that arrives after it retired (end of file, failure) must restart
+	// the source itself: nobody else would read the queued target.
+	loopAlive bool
+	pending   func() // deferred action after a fade, e.g. stop
+	volume    float64
+	muted     bool
 
 	pulled  atomic.Uint64 // frames handed to the device since the last seek
 	decoded atomic.Uint64 // frames produced by the decoder since the last seek
 	gen     generations
 	quit    chan struct{}
 	wake    chan struct{}
-	seekReq chan time.Duration
+	seekReq chan seekRequest
 	closed  bool
 	decWG   sync.WaitGroup
 	monWG   sync.WaitGroup
@@ -213,7 +220,7 @@ func New(cfg Config) (*Player, error) {
 		clock:   newClock(pcm.DefaultSampleRate),
 		quit:    make(chan struct{}),
 		wake:    make(chan struct{}, 1),
-		seekReq: make(chan time.Duration, 1),
+		seekReq: make(chan seekRequest, 1),
 		volume:  cfg.Volume,
 	}
 	p.pipe.Store(pcm.NewPipe(cfg.RingFrames, pcm.DefaultFormat()))
@@ -267,6 +274,9 @@ func (p *Player) Open(ctx context.Context, src decode.Source, opts OpenOptions) 
 	p.eof = false
 	p.primed = false
 	p.wantPlay = opts.AutoPlay
+	p.seekRebuilds = seekRebuildBudget
+	p.loopAlive = true
+	p.dropQueuedSeek() // a target queued for the previous track must not move this one
 	p.pending = nil
 	p.pulled.Store(0)
 	p.decoded.Store(0)
@@ -299,6 +309,8 @@ func (p *Player) Play() error {
 		}
 		gen, src := p.gen.curLoad(), p.src
 		p.state = StateLoading
+		p.seekRebuilds = seekRebuildBudget
+		p.loopAlive = true
 		p.mu.Unlock()
 		p.decWG.Add(1)
 		go p.decodeLoop(context.Background(), gen, src, p.base)
@@ -400,6 +412,8 @@ func (p *Player) hardStop() {
 	p.wantPlay = false
 	p.eof = false
 	p.primed = false
+	p.dropQueuedSeek()
+	p.loopAlive = false
 	p.state = StateStopped
 	p.clock.base = 0
 	p.pulled.Store(0)
@@ -445,6 +459,13 @@ func (p *Player) Seek(d time.Duration) error {
 	p.pipe.Load().Interrupt()
 	stream := p.stream
 	meta := p.meta
+	alive := p.loopAlive
+	if alive {
+		// Queue under the same lock that retires the loop: either the decoder
+		// sees this target, or it already marked itself dead and we restart
+		// below. A seek must never be queued to a goroutine that has exited.
+		p.enqueueSeek(seekRequest{at: d, gen: seekGen})
+	}
 	p.mu.Unlock()
 
 	if stream == nil {
@@ -456,23 +477,177 @@ func (p *Player) Seek(d time.Duration) error {
 		// Nothing decoded yet: the position is remembered for the next load.
 		return nil
 	}
-	if !meta.Seekable {
-		return p.reopen(d, p.State() == StatePlaying)
+	if !meta.Seekable || !alive {
+		// No live decoder to serve the target (unseekable source, or the loop
+		// retired at EOF/a failure): rebuild the pipeline at d.
+		return p.reopen(d, p.resumeIntent())
 	}
+	// Run the seek on the decode goroutine (applyPendingSeek), never here.
+	//
+	// Performing it in a goroutine per UI event used to queue one network seek
+	// after another behind the stream lock: dragging the progress bar piled up
+	// dozens of stale targets, each doing a full HTTP range search, and the
+	// decoder produced nothing until the whole queue drained — the "seek
+	// freezes playback / stutters" regression. The channel holds only the
+	// newest target, so a drag costs at most one in-flight seek plus one
+	// queued replacement.
 	p.nudge()
-	go func() {
-		if _, err := stream.Seek(d); err != nil {
-			if errors.Is(err, decode.ErrSeekUnsupported) {
-				p.reopen(d, p.State() == StatePlaying)
-				return
-			}
-			p.fail(fmt.Errorf("seek: %w", err))
+	return nil
+}
+
+// seekRequest is one pending position. gen identifies the Seek that produced
+// it so a target superseded while another seek is in flight can be dropped.
+type seekRequest struct {
+	at  time.Duration
+	gen uint64
+}
+
+// enqueueSeek replaces the queued target with req. It never blocks (the UI
+// thread must not wait on the decoder) and only the newest target survives.
+func (p *Player) enqueueSeek(req seekRequest) {
+	select {
+	case <-p.seekReq:
+	default:
+	}
+	select {
+	case p.seekReq <- req:
+	default:
+	}
+}
+
+// requeueSeek puts a target back only when the slot is free: a newer target
+// already queued wins (the old one is stale by definition).
+func (p *Player) requeueSeek(req seekRequest) {
+	select {
+	case p.seekReq <- req:
+	default:
+	}
+}
+
+// takeQueuedSeek pops the queued target, if any.
+func (p *Player) takeQueuedSeek() (seekRequest, bool) {
+	select {
+	case req := <-p.seekReq:
+		return req, true
+	default:
+		return seekRequest{}, false
+	}
+}
+
+// retireLoop marks this generation's decode goroutine as gone and hands back a
+// target that was queued meanwhile. The flag and the pop happen under p.mu —
+// the same lock Seek takes to decide between "queue it" and "restart the
+// source" — so a seek can never be queued to a loop that has already exited.
+func (p *Player) retireLoop(gen uint64) (seekRequest, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if gen != p.gen.curLoad() {
+		return seekRequest{}, false
+	}
+	p.loopAlive = false
+	select {
+	case req := <-p.seekReq:
+		return req, true
+	default:
+		return seekRequest{}, false
+	}
+}
+
+// retireLoopQuiet is the deferred counterpart for exits other than EOF.
+func (p *Player) retireLoopQuiet(gen uint64) {
+	p.mu.Lock()
+	if gen == p.gen.curLoad() {
+		p.loopAlive = false
+	}
+	p.mu.Unlock()
+}
+
+// dropQueuedSeek forgets a target that belongs to a previous load/seek.
+func (p *Player) dropQueuedSeek() {
+	for {
+		if _, ok := p.takeQueuedSeek(); !ok {
 			return
 		}
-		p.publish(Event{Kind: KindSeeked, SeekGen: seekGen})
-		p.pipe.Load().Wake()
-	}()
-	return nil
+	}
+}
+
+// seekRebuildBudget bounds how many times a failed seek may rebuild the
+// decoder before the track is declared broken. A failed seek leaves the
+// demuxer in an undefined state, so retrying on the same context is not an
+// option; one retry covers the transient CDN hiccup that caused it without
+// letting a permanently unseekable source loop forever.
+const seekRebuildBudget = 1
+
+// resumeIntent reports whether a rebuilt pipeline should start producing
+// sound. Play/Pause own wantPlay, so a seek issued while paused stays paused
+// and a seek issued while buffering still resumes.
+func (p *Player) resumeIntent() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.wantPlay
+}
+
+// takeSeekRebuild consumes one rebuild attempt from the current load's budget.
+func (p *Player) takeSeekRebuild() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.seekRebuilds <= 0 {
+		return false
+	}
+	p.seekRebuilds--
+	return true
+}
+
+// rebuildAfterSeek replaces the decoder when an in-place seek failed.
+//
+// Seeking an HTTP source is a burst of Range reads (the demuxer's index search
+// probes arbitrary offsets), so one slow reply surfaces inside FFmpeg as
+// "Error reading HTTP response: Connection timed out" and then
+// "read_timestamp() failed in the middle" — after which the demuxer's state is
+// undefined. Failing the whole track there is what made a seek feel like it
+// "killed" the song; a fresh open at the target is both safe and the same
+// path a pending load takes.
+func (p *Player) rebuildAfterSeek(gen uint64, at time.Duration, cause error) error {
+	p.mu.Lock()
+	stale := p.closed || gen != p.gen.curLoad()
+	resume := p.wantPlay
+	p.mu.Unlock()
+	if stale {
+		p.logf("seek rebuild skipped: generation moved on")
+		return nil
+	}
+	if !p.takeSeekRebuild() {
+		return fmt.Errorf("seek: %w", cause)
+	}
+	p.logf("seek to %s failed (%v); rebuilding the decoder at the target", at, cause)
+	// Guard only the load generation: the attempt above read the newest queued
+	// target under this same generation, and any seek that arrives late is
+	// picked up by the rebuilt decode loop.
+	return p.reopenIf(gen, 0, at, resume)
+}
+
+// rebuildAfterRead recovers a transient decode failure (a connection reset, a
+// CDN dropping a range mid-song) by reopening the source at the position the
+// listener actually heard. It reports whether recovery started; the caller
+// then ends this generation. Permanently broken media exhausts the budget and
+// fails normally.
+func (p *Player) rebuildAfterRead(gen uint64, cause error) bool {
+	p.mu.Lock()
+	if p.closed || gen != p.gen.curLoad() || !p.meta.Seekable {
+		p.mu.Unlock()
+		return false
+	}
+	pos := p.clock.position(p.pulled.Load())
+	resume := p.wantPlay
+	p.mu.Unlock()
+	if !p.takeSeekRebuild() {
+		return false
+	}
+	p.logf("decoder read failed at %s (%v); reopening the source", pos, cause)
+	if err := p.reopenIf(gen, 0, pos, resume); err != nil {
+		p.failGen(gen, err)
+	}
+	return true
 }
 
 // SeekTo is the float-seconds convenience used by UI sliders.
@@ -718,6 +893,7 @@ func (p *Player) Close() error {
 	p.closed = true
 	p.wantPlay = false
 	p.state = StateClosed
+	p.loopAlive = false
 	p.pending = nil
 	out := p.out
 	stream := p.stream
@@ -748,10 +924,25 @@ func (p *Player) Close() error {
 // reopen reloads the current source at a position, used when a seek is not
 // possible in place (live streams, reader-backed sources, dead devices).
 func (p *Player) reopen(at time.Duration, resume bool) error {
+	return p.reopenIf(0, 0, at, resume)
+}
+
+// reopenIf is reopen guarded by the generations the caller observed. When a
+// newer load (or seek) already owns the pipeline it does nothing: the check and
+// the generation bump happen under the same lock, so a recovery started for a
+// stale seek/failure can never clobber a newer one. A zero generation means
+// "don't check that counter".
+func (p *Player) reopenIf(loadGen, seekGen uint64, at time.Duration, resume bool) error {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		return ErrClosed
+	}
+	if loadGen != 0 {
+		if loadGen != p.gen.curLoad() || (seekGen != 0 && seekGen != p.gen.curSeek()) {
+			p.mu.Unlock()
+			return nil
+		}
 	}
 	gen := p.gen.nextLoad()
 	src := p.src
@@ -763,13 +954,22 @@ func (p *Player) reopen(at time.Duration, resume bool) error {
 	p.clock = newClock(pcm.DefaultSampleRate)
 	p.clock.base = at
 	p.state = StateLoading
+	p.loopAlive = true
 	p.pipe.Load().Swap(gen)
 	p.chain.Reset()
 	stream := p.stream
 	p.stream = nil
 	p.mu.Unlock()
 	if stream != nil {
-		_ = stream.Close()
+		// Close in the background: the abandoned stream may be parked in a
+		// network read (up to rw_timeout), and the new generation must not
+		// wait for it before producing sound. Close takes the stream lock, so
+		// it waits for that read to return and then releases the decoder.
+		p.decWG.Add(1)
+		go func() {
+			defer p.decWG.Done()
+			_ = stream.Close()
+		}()
 	}
 	p.decWG.Add(1)
 	go p.decodeLoop(context.Background(), gen, src, at)

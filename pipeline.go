@@ -134,6 +134,26 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 	if startAt > 0 && seekable {
 		if _, err := stream.Seek(startAt); err != nil {
 			_ = stream.Close()
+			if p.stale(gen) {
+				return
+			}
+			// Same failure a user-initiated seek hits: a slow Range read in the
+			// demuxer's index search leaves the context unusable. Rebuild the
+			// decoder at the target instead of failing the load; the budget
+			// keeps a permanently unseekable source from looping.
+			if p.takeSeekRebuild() {
+				// Honour a seek that arrived while this one was in flight:
+				// the user's latest target is the position to rebuild at.
+				target := startAt
+				if next, ok := p.takeQueuedSeek(); ok {
+					target = next.at
+				}
+				p.logf("initial seek to %s failed (%v); reopening the source at %s", startAt, err, target)
+				if rerr := p.reopenIf(gen, 0, target, p.resumeIntent()); rerr != nil {
+					p.failGen(gen, rerr)
+				}
+				return
+			}
 			p.failGen(gen, fmt.Errorf("seek to start: %w", err))
 			return
 		}
@@ -150,12 +170,11 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 		p.meta.Codec, p.meta.SampleRate, p.meta.Channels, p.meta.Duration)
 
 	buf := make([]float32, 0, pcm.ChunkFrames*srcCh)
+	defer p.retireLoopQuiet(gen)
 	for {
 		// Seeks are executed here: the decoder context is single-goroutine.
-		if err := p.applyPendingSeek(gen, stream); err != nil {
-			if !errors.Is(err, decode.ErrSeekUnsupported) {
-				p.failGen(gen, err)
-			}
+		// true means this generation must stop (rebuilt or superseded).
+		if p.applyPendingSeek(gen, stream) {
 			return
 		}
 
@@ -163,9 +182,21 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				p.markEOF(gen)
+				// A seek may have been queued while the tail was draining.
+				// This goroutine is the only reader, and it is about to exit;
+				// hand the target back and restart there instead of silently
+				// dropping it (the "seek near the end freezes playback" bug).
+				if req, ok := p.retireLoop(gen); ok {
+					if rerr := p.reopen(req.at, p.resumeIntent()); rerr != nil {
+						p.failGen(gen, rerr)
+					}
+				}
 				return
 			}
 			if p.stale(gen) {
+				return
+			}
+			if p.rebuildAfterRead(gen, err) {
 				return
 			}
 			p.failGen(gen, err)
@@ -212,42 +243,66 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 	// hand it over rather than racing this goroutine on the decoder context.
 }
 
-// applyPendingSeek performs a queued seek on the decoder owned by this
-// generation. It returns a non-nil error when playback must stop.
-func (p *Player) applyPendingSeek(gen uint64, stream decode.Stream) error {
-	var target time.Duration
-	select {
-	case target = <-p.seekReq:
-	default:
-		return nil
+// applyPendingSeek performs the newest queued seek on the decoder owned by
+// this generation. It returns true when this generation must stop: the decoder
+// was rebuilt (a new loop owns it) or a newer generation took over.
+//
+// Running seeks here instead of on a goroutine per UI event is what keeps a
+// progress-bar drag from queueing network seeks behind the stream lock. The
+// channel holds one target, so at most one seek is in flight and the newest
+// request always wins.
+func (p *Player) applyPendingSeek(gen uint64, stream decode.Stream) bool {
+	if p.stale(gen) {
+		return true
+	}
+	req, ok := p.takeQueuedSeek()
+	if !ok {
+		return false
 	}
 	if p.stale(gen) {
-		return nil
+		// This loop lost the pipeline after the pop; hand the target to the
+		// new generation instead of swallowing it.
+		p.requeueSeek(req)
+		return true
+	}
+	// A newer Seek was issued while this one was queued: its target is already
+	// in the channel (or in flight) and the clock already points there. Drop
+	// this stale target rather than paying for a network seek nobody wants.
+	if req.gen != p.gen.curSeek() {
+		return false
 	}
 	p.mu.Lock()
 	seekable := p.meta.Seekable
-	pos := p.clock.base
+	p.clock.base = req.at
 	p.mu.Unlock()
-	if pos != target {
-		p.mu.Lock()
-		p.clock.base = target
-		p.mu.Unlock()
-		p.pulled.Store(0)
-	}
+	p.pulled.Store(0)
 	if !seekable {
-		p.logf("source is not seekable, reloading at %s", target)
-		return fmt.Errorf("%w: reload", decode.ErrSeekUnsupported)
-	}
-	if _, err := stream.Seek(target); err != nil {
-		if errors.Is(err, decode.ErrSeekUnsupported) {
-			return err
+		p.logf("source is not seekable, reloading at %s", req.at)
+		if err := p.reopen(req.at, p.resumeIntent()); err != nil {
+			p.failGen(gen, err)
 		}
-		return fmt.Errorf("seek: %w", err)
+		return true
 	}
+	// Drop whatever the previous position left buffered: the producer may have
+	// written a chunk between the Seek call and this point.
 	p.pipe.Load().Reset()
+	if _, err := stream.Seek(req.at); err != nil {
+		p.logf("in-place seek to %s failed: %v", req.at, err)
+		// A failed seek leaves the demuxer undefined; rebuild at the newest
+		// target instead of killing the track. If another drag arrived while
+		// the seek was in flight, rebuild there.
+		target := req.at
+		if next, ok := p.takeQueuedSeek(); ok {
+			target = next.at
+		}
+		if rerr := p.rebuildAfterSeek(gen, target, err); rerr != nil {
+			p.failGen(gen, rerr)
+		}
+		return true
+	}
 	p.nudge()
-	p.logf("seeked to %s", target)
-	return nil
+	p.logf("seeked to %s", req.at)
+	return false
 }
 
 func (p *Player) decodeOptions() decode.Options {

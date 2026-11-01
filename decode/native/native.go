@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/team-quaver/ffgo"
 	"github.com/team-quaver/ffgo/avcodec"
+	"github.com/team-quaver/ffgo/avutil"
 
 	"github.com/team-quaver/liino/decode"
 	"github.com/team-quaver/liino/pcm"
@@ -100,17 +102,23 @@ func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options)
 		fopts.AnalyzeDuration = opts.AnalyzeDuration
 	}
 	av := avOptions(src.Options)
-	// Network sources go through FFmpeg's default AVIO stack, which has no read
-	// deadline by default: a stalled CDN connection parks the decoder goroutine
-	// forever and Close() waits on it. 5 s is long enough for a healthy range
-	// read and short enough to turn a dead peer into a normal playback error.
 	if hasScheme(src.URI) {
+		av = networkAVOptions(av)
+	}
+	// FLAC with a SEEKTABLE can seek straight from the index instead of the
+	// demuxer's binary search. That search is accurate but costs ~log2(size)
+	// Range round trips — on a rate-limited CDN relay a drag took seconds.
+	// The index can land seconds early, so Seek() then decodes past the target
+	// (see discardBefore); fastSeek covers that.
+	fastSeek := false
+	if flags, ok := av["fflags"]; ok {
+		fastSeek = strings.Contains(flags, "+fastseek")
+	} else if src.Reader == nil && !src.IsLive() && flacHasSeekTable(ctx, src) {
 		if av == nil {
 			av = make(map[string]string)
 		}
-		if _, ok := av["rw_timeout"]; !ok {
-			av["rw_timeout"] = "5000000"
-		}
+		av["fflags"] = "+fastseek"
+		fastSeek = true
 	}
 	if len(av) > 0 {
 		fopts.AVOptions = av
@@ -172,11 +180,13 @@ func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options)
 		channels = pcm.DefaultChannels
 	}
 	return &stream{
-		dec:    dec,
-		meta:   meta,
-		sample: meta.SampleRate,
-		chans:  meta.Channels,
-		chunk:  pcm.Chunk{Data: make([]float32, frames*channels), Frames: 0, Format: pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: channels}},
+		dec:      dec,
+		meta:     meta,
+		log:      opts.Log,
+		fastSeek: fastSeek,
+		sample:   meta.SampleRate,
+		chans:    meta.Channels,
+		chunk:    pcm.Chunk{Data: make([]float32, frames*channels), Frames: 0, Format: pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: channels}},
 	}, nil
 }
 
@@ -184,9 +194,18 @@ func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options)
 type stream struct {
 	dec  *ffgo.Decoder
 	meta decode.Meta
+	log  func(string)
 
-	sample int // source sample rate, refreshed when the decoder changes it
-	chans  int // source channel count
+	// fastSeek is set when the container has a seek index (a FLAC SEEKTABLE)
+	// and AVFMT_FLAG_FAST_SEEK was enabled. Seeks then land on the nearest
+	// index point, so Seek decodes forward to the requested time.
+	fastSeek bool
+	// pending is the first frame decoded while discarding after a fast seek.
+	// It belongs to the decoder and is consumed before the next DecodeAudio.
+	pending ffgo.Frame
+	hasPend bool
+	sample  int // source sample rate, refreshed when the decoder changes it
+	chans   int // source channel count
 
 	resample   *ffgo.Resampler
 	resampleTo ffgo.AudioFormat
@@ -196,6 +215,12 @@ type stream struct {
 	closed bool
 	mu     sync.Mutex
 }
+
+// maxCorruptFrames bounds how many consecutive invalid frames a source may
+// produce before the decoder is declared broken. One or two corrupt frames are
+// common at the very end of CDN-hosted FLAC (the file ends with a truncated
+// frame) and a seek can land on a partial one; endless invalid data is not.
+const maxCorruptFrames = 16
 
 type resampleFrom struct {
 	rate, channels int
@@ -214,13 +239,35 @@ func (s *stream) Read() (pcm.Chunk, error) {
 		return pcm.Chunk{}, decode.ErrNotOpen
 	}
 
+	corrupt := 0
 	for {
-		frame, err := s.dec.DecodeAudio()
-		if err != nil {
-			if errors.Is(err, io.EOF) || ffgo.IsEOF(err) {
-				return pcm.Chunk{}, io.EOF
+		var frame ffgo.Frame
+		if s.hasPend {
+			frame, s.hasPend = s.pending, false
+			s.pending = ffgo.Frame{}
+		} else {
+			next, err := s.dec.DecodeAudio()
+			if err != nil {
+				if errors.Is(err, io.EOF) || ffgo.IsEOF(err) {
+					return pcm.Chunk{}, io.EOF
+				}
+				// A decoder-level invalid frame is not a dead source. QQ's FLAC
+				// files routinely end with a truncated frame (the whole track
+				// decodes, then the tail fails), and a seek can land on a partial
+				// frame; FLAC frames are independent, so dropping one and reading
+				// on resynchronises. Treating it as fatal ended the track right
+				// before EOF — which also meant "ended" never fired and the next
+				// song never started.
+				if avutil.IsInvalidData(err) && corrupt < maxCorruptFrames {
+					corrupt++
+					if s.log != nil {
+						s.log(fmt.Sprintf("decode native: skipping corrupt frame (%v)", err))
+					}
+					continue
+				}
+				return pcm.Chunk{}, err
 			}
-			return pcm.Chunk{}, err
+			frame = next
 		}
 		if frame.IsNil() {
 			return pcm.Chunk{}, io.EOF
@@ -374,7 +421,59 @@ func (s *stream) Seek(t time.Duration) (time.Duration, error) {
 		s.resample = nil
 	}
 	s.dec.FlushDecoder()
+	s.pending, s.hasPend = ffgo.Frame{}, false
+	if s.fastSeek {
+		// A fast seek lands on the nearest index point, which can be seconds
+		// before t. Decode past it so the audio matches the clock the host set.
+		if err := s.discardBefore(t); err != nil {
+			return 0, err
+		}
+	}
 	return t, nil
+}
+
+// maxDiscardFrames bounds how far a fast seek may decode forward. FLAC
+// SEEKTABLE spacing is a handful of seconds (≈4096 samples per frame); 512
+// frames covers ~47 s at 44.1 kHz, far beyond any sane index gap.
+const maxDiscardFrames = 512
+
+// discardBefore decodes and drops frames whose PTS is before t, keeping the
+// first frame at/after t for the next Read. FLAC frame PTS are absolute sample
+// numbers in the stream's sample rate.
+func (s *stream) discardBefore(t time.Duration) error {
+	rate := s.sample
+	if rate <= 0 {
+		return nil
+	}
+	target := int64(t.Seconds() * float64(rate))
+	for i := 0; i < maxDiscardFrames; i++ {
+		frame, err := s.dec.DecodeAudio()
+		if err != nil {
+			if errors.Is(err, io.EOF) || ffgo.IsEOF(err) {
+				return nil // seeked past the tail: let Read report EOF
+			}
+			// Same tolerance as Read: one corrupt frame must not fail a seek.
+			if avutil.IsInvalidData(err) {
+				continue
+			}
+			return err
+		}
+		if frame.IsNil() {
+			return nil
+		}
+		w := ffgo.WrapFrame(frame, ffgo.MediaTypeAudio)
+		pts := w.PTS()
+		if pts == avutil.AV_NOPTS_VALUE {
+			// No timetable to verify against: keep it rather than drop audio.
+			s.pending, s.hasPend = frame, true
+			return nil
+		}
+		if pts >= target {
+			s.pending, s.hasPend = frame, true
+			return nil
+		}
+	}
+	return nil // index gap larger than the bound: play from where we are
 }
 
 // Close releases FFmpeg contexts.
@@ -412,6 +511,121 @@ func avOptions(in map[string]string) map[string]string {
 		return nil
 	}
 	return out
+}
+
+// Network AVIO defaults. A seek on an HTTP source is not one read: the
+// demuxer's index search issues Range requests at arbitrary offsets, so a
+// single slow origin reply can surface in the middle of it as
+// "Error reading HTTP response: Connection timed out" followed by
+// "read_timestamp() failed in the middle" — and a demuxer whose seek failed
+// has undefined state. Give the range read the same budget the sidecar gives
+// its own upstream (15 s) instead of the old 5 s, and let FFmpeg reconnect
+// instead of aborting playback when a connection is reset mid-stream.
+const (
+	networkReadTimeout = "15000000" // microseconds
+	networkReconnect   = "5"        // seconds between reconnect attempts
+	networkMaxRetries  = "5"        // attempts before the read fails for real
+)
+
+func networkAVOptions(in map[string]string) map[string]string {
+	out := in
+	if out == nil {
+		out = make(map[string]string)
+	}
+	// Caller-supplied avopt:* values (including a shorter rw_timeout) win.
+	defaults := map[string]string{
+		"rw_timeout":                 networkReadTimeout,
+		"reconnect":                  "1",
+		"reconnect_streamed":         "1",
+		"reconnect_on_network_error": "1",
+		"reconnect_delay_max":        networkReconnect,
+		"reconnect_max_retries":      networkMaxRetries,
+	}
+	for k, v := range defaults {
+		if _, ok := out[k]; !ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// flacProbeBytes is enough for the STREAMINFO/SEEKTABLE/VORBIS_COMMENT/PADDING
+// blocks QQ and ffmpeg write (they all fit in the first 8 KiB).
+const flacProbeBytes = 8 << 10
+
+// flacHasSeekTable reports whether src is a native FLAC stream carrying a
+// SEEKTABLE metadata block. Sniffing costs one small Range read on a URL and
+// is best-effort: any failure means "no index", and the decoder keeps FFmpeg's
+// (accurate but slower) binary seek.
+func flacHasSeekTable(ctx context.Context, src decode.Source) bool {
+	// Probe only local files and the host's own /stream/ relay. A third-party
+	// plugin can hand us a one-shot URL, and an extra GET would consume it;
+	// those sources just keep the demuxer's (correct) binary seek.
+	if hasScheme(src.URI) && !strings.HasPrefix(src.URI, "file://") && !strings.Contains(src.URI, "/stream/") {
+		return false
+	}
+	head, err := readHead(ctx, src, flacProbeBytes)
+	if err != nil || len(head) < 8 {
+		return false
+	}
+	if string(head[:4]) != "fLaC" {
+		return false
+	}
+	for off := 4; off+4 <= len(head); {
+		h := head[off]
+		typ := h & 0x7f
+		last := h&0x80 != 0
+		length := int(head[off+1])<<16 | int(head[off+2])<<8 | int(head[off+3])
+		if typ == 3 { // SEEKTABLE
+			return true
+		}
+		if last {
+			return false
+		}
+		off += 4 + length
+	}
+	return false
+}
+
+// readHead returns up to n leading bytes of the source. Local files are read
+// directly; http(s) uses a bounded Range request so a server that ignores
+// Range cannot make the probe download the whole track.
+func readHead(ctx context.Context, src decode.Source, n int) ([]byte, error) {
+	if !hasScheme(src.URI) || strings.HasPrefix(src.URI, "file://") {
+		path, err := localPath(src.URI)
+		if err != nil {
+			return nil, err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		buf := make([]byte, n)
+		m, _ := io.ReadFull(f, buf) // short reads are fine
+		return buf[:m], nil
+	}
+	if !strings.HasPrefix(src.URI, "http://") && !strings.HasPrefix(src.URI, "https://") {
+		return nil, errors.New("decode native: unsupported scheme for header probe")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.URI, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", n-1))
+	if ua := src.Options["user_agent"]; ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, n)
+	m, _ := io.ReadFull(io.LimitReader(resp.Body, int64(n)), buf)
+	return buf[:m], nil
 }
 
 // localPath converts file:// URIs into plain paths and validates local files so

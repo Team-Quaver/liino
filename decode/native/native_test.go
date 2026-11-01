@@ -303,6 +303,75 @@ func TestCodecsProbe(t *testing.T) {
 	t.Logf("detected codecs: %v", codecs)
 }
 
+// Network AVIO defaults: a seek is a burst of Range reads, so a 5 s read
+// deadline used to turn one slow CDN reply into "Connection timed out" and a
+// dead demuxer ("read_timestamp() failed in the middle"). The defaults give
+// the read the sidecar's own 15 s upstream budget and let FFmpeg reconnect.
+// Caller-supplied avopt values must win.
+func TestNetworkAVOptions(t *testing.T) {
+	got := networkAVOptions(nil)
+	if got["rw_timeout"] != networkReadTimeout {
+		t.Fatalf("rw_timeout = %q, want %q", got["rw_timeout"], networkReadTimeout)
+	}
+	for _, key := range []string{"reconnect", "reconnect_streamed", "reconnect_on_network_error", "reconnect_delay_max", "reconnect_max_retries"} {
+		if got[key] == "" {
+			t.Fatalf("%s not set in %v", key, got)
+		}
+	}
+
+	custom := networkAVOptions(map[string]string{"rw_timeout": "1000000", "reconnect": "0"})
+	if custom["rw_timeout"] != "1000000" || custom["reconnect"] != "0" {
+		t.Fatalf("caller overrides lost: %v", custom)
+	}
+}
+
+// FLAC fast seeking is only safe when the stream carries a SEEKTABLE: without
+// one the demuxer has no index and avformat would fail every seek. The probe
+// decides whether fflags=+fastseek is set.
+func TestFlacSeekTableDetection(t *testing.T) {
+	block := func(typ byte, last bool, n int) []byte {
+		h := typ
+		if last {
+			h |= 0x80
+		}
+		return append([]byte{h, byte(n >> 16), byte(n >> 8), byte(n)}, make([]byte, n)...)
+	}
+	write := func(name string, data []byte) string {
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	with := []byte("fLaC")
+	with = append(with, block(0, false, 34)...) // STREAMINFO
+	with = append(with, block(3, false, 18)...) // SEEKTABLE
+	with = append(with, block(4, true, 16)...)  // VORBIS_COMMENT (last)
+	without := []byte("fLaC")
+	without = append(without, block(0, false, 34)...)
+	without = append(without, block(4, true, 16)...)
+
+	cases := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"seektable.flac", with, true},
+		{"plain.flac", without, false},
+		{"notflac.bin", []byte("OggS...."), false},
+	}
+	for _, tc := range cases {
+		path := write(tc.name, tc.data)
+		if got := flacHasSeekTable(context.Background(), decode.Source{URI: path}); got != tc.want {
+			t.Fatalf("%s: flacHasSeekTable = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	if flacHasSeekTable(context.Background(), decode.Source{URI: filepath.Join(t.TempDir(), "missing.flac")}) {
+		t.Fatal("missing file must not report a seektable")
+	}
+}
+
 func absInt(v int) int {
 	if v < 0 {
 		return -v

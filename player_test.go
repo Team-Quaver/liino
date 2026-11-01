@@ -22,13 +22,26 @@ type fakeBackend struct {
 	opened  int
 	failErr error
 	seekErr error
+	// seekErrOnOpen makes only the stream from this 1-based Open reject seeks,
+	// modelling a transient network failure: the rebuilt decoder seeks fine.
+	seekErrOnOpen int
+	// readErrOnOpen + readErrAfter make that Open's stream fail a read once it
+	// has produced readErrAfter frames (a CDN reset mid-song).
+	readErrOnOpen int
+	readErrAfter  int
 }
 
 type fakeStream struct {
+	// Real streams serialise Read/Seek/Close on their own mutex (the engine
+	// seeks on a goroutine while the producer reads); mirror that here so the
+	// race detector only sees production races.
+	mu        sync.Mutex
 	frames    int // total frames in the synthetic track
 	produced  int
 	seeked    []time.Duration
 	seekErr   error
+	readErr   error
+	readAfter int
 	closed    bool
 	chunkSize int
 	meta      decode.Meta
@@ -48,7 +61,7 @@ func (b *fakeBackend) Open(context.Context, decode.Source, decode.Options) (deco
 		return nil, b.failErr
 	}
 	total := pcm.DefaultSampleRate * 2 // two seconds
-	return &fakeStream{
+	s := &fakeStream{
 		frames:    total,
 		chunkSize: pcm.ChunkFrames,
 		meta: decode.Meta{
@@ -58,15 +71,31 @@ func (b *fakeBackend) Open(context.Context, decode.Source, decode.Options) (deco
 			Duration:   2 * time.Second,
 			Seekable:   true,
 		},
-	}, nil
+	}
+	switch {
+	case b.seekErr != nil:
+		s.seekErr = b.seekErr
+	case b.seekErrOnOpen != 0 && b.seekErrOnOpen == b.opened:
+		s.seekErr = errors.New("range read timed out")
+	}
+	if b.readErrOnOpen != 0 && b.readErrOnOpen == b.opened {
+		s.readErr = errors.New("connection reset by peer")
+		s.readAfter = b.readErrAfter
+	}
+	return s, nil
 }
 
 func (s *fakeStream) Format() pcm.Format { return pcm.DefaultFormat() }
 func (s *fakeStream) Meta() decode.Meta  { return s.meta }
 
 func (s *fakeStream) Read() (pcm.Chunk, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
 		return pcm.Chunk{}, decode.ErrNotOpen
+	}
+	if s.readErr != nil && s.produced >= s.readAfter {
+		return pcm.Chunk{}, s.readErr
 	}
 	if s.produced >= s.frames {
 		return pcm.Chunk{}, io.EOF
@@ -84,6 +113,8 @@ func (s *fakeStream) Read() (pcm.Chunk, error) {
 }
 
 func (s *fakeStream) Seek(t time.Duration) (time.Duration, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.seekErr != nil {
 		return 0, s.seekErr
 	}
@@ -92,7 +123,12 @@ func (s *fakeStream) Seek(t time.Duration) (time.Duration, error) {
 	return t, nil
 }
 
-func (s *fakeStream) Close() error { s.closed = true; return nil }
+func (s *fakeStream) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return nil
+}
 
 func registerFake(t *testing.T, b *fakeBackend) {
 	t.Helper()
@@ -176,6 +212,38 @@ func TestPlayerPlaysToCompletion(t *testing.T) {
 	}
 }
 
+// A seek that arrives after the decoder reached EOF must restart playback.
+// The decode goroutine has retired at that point; queueing the target would
+// leave nobody to read it (the "seek near the end freezes the track" bug).
+func TestSeekAfterEndRestartsPlayback(t *testing.T) {
+	fake := &fakeBackend{}
+	registerFake(t, fake)
+
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(128)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StateEnded, 6*time.Second)
+
+	if err := p.Seek(500 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Play(); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+	if snap := p.Snapshot(); snap.Position < 450*time.Millisecond {
+		t.Fatalf("position after restart = %s, want ~0.5s", snap.Position)
+	}
+}
+
 func TestPlayerSeekMovesPosition(t *testing.T) {
 	fake := &fakeBackend{}
 	registerFake(t, fake)
@@ -201,6 +269,148 @@ func TestPlayerSeekMovesPosition(t *testing.T) {
 	}
 	if snap := p.Snapshot(); snap.Position < 1450*time.Millisecond {
 		t.Fatalf("position after seek = %s", snap.Position)
+	}
+}
+
+// A failed in-place seek must not kill the track. Seeking an HTTP source is a
+// burst of Range reads; when one times out FFmpeg fails the seek and leaves
+// the demuxer in an undefined state. The player must rebuild the decoder at
+// the target (and keep playing) instead of reporting a fatal error — this is
+// the "seek ruins the whole song" regression.
+func TestSeekFailureRebuildsDecoderAtTarget(t *testing.T) {
+	fake := &fakeBackend{seekErrOnOpen: 1}
+	registerFake(t, fake)
+
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(128)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 2*time.Second)
+
+	if err := p.Seek(1500 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+
+	// The seek is asynchronous and the clock is already at 1.5 s, so wait for
+	// the rebuild itself rather than for the position.
+	deadline := time.Now().Add(3 * time.Second)
+	opened := 0
+	for time.Now().Before(deadline) {
+		fake.mu.Lock()
+		opened = fake.opened
+		fake.mu.Unlock()
+		if opened >= 2 {
+			break
+		}
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatal("event stream closed")
+			}
+			if ev.Kind == KindFailed {
+				t.Fatalf("failed seek killed the track: %s", ev.Err)
+			}
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if opened < 2 {
+		t.Fatalf("decoder opened %d times, want a rebuild", opened)
+	}
+
+	waitState(t, p, events, StatePlaying, 2*time.Second)
+	if snap := p.Snapshot(); snap.State == StateFailed {
+		t.Fatalf("failed seek killed the track: %s", snap.Error)
+	} else if snap.Position < 1450*time.Millisecond {
+		t.Fatalf("position after rebuilt seek = %s, want ~1.5s", snap.Position)
+	}
+}
+
+// The same recovery applies to a load that starts at an offset (resume /
+// window rebuild): the initial seek runs on a cold demuxer and can time out
+// just like a user seek.
+func TestInitialSeekFailureReopensSource(t *testing.T) {
+	fake := &fakeBackend{seekErrOnOpen: 1}
+	registerFake(t, fake)
+
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(128)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{
+		AutoPlay: true,
+		StartAt:  1500 * time.Millisecond,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+
+	fake.mu.Lock()
+	opened := fake.opened
+	fake.mu.Unlock()
+	if opened < 2 {
+		t.Fatalf("decoder opened %d times, want a retry", opened)
+	}
+	if snap := p.Snapshot(); snap.Position < 1450*time.Millisecond {
+		t.Fatalf("position after rebuilt initial seek = %s, want ~1.5s", snap.Position)
+	}
+}
+
+// A read failure mid-song (CDN reset, dropped range) used to mark the whole
+// track failed. It must reopen at the heard position and keep going.
+func TestReadFailureReopensAtHeardPosition(t *testing.T) {
+	fake := &fakeBackend{readErrOnOpen: 1, readErrAfter: 4800}
+	registerFake(t, fake)
+
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(128)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	opened := 0
+	for time.Now().Before(deadline) {
+		fake.mu.Lock()
+		opened = fake.opened
+		fake.mu.Unlock()
+		if opened >= 2 {
+			break
+		}
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatal("event stream closed")
+			}
+			if ev.Kind == KindFailed {
+				t.Fatalf("read failure killed the track: %s", ev.Err)
+			}
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if opened < 2 {
+		t.Fatalf("decoder opened %d times, want a reopen", opened)
+	}
+
+	waitState(t, p, events, StatePlaying, 2*time.Second)
+	if snap := p.Snapshot(); snap.State == StateFailed {
+		t.Fatalf("read failure killed the track: %s", snap.Error)
 	}
 }
 
