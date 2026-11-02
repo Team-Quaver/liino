@@ -224,6 +224,13 @@ type session struct {
 	state   output.State
 	scratch []float32
 	paused  atomic.Bool
+	// running mirrors state == output.StateRunning for the audio callback.
+	// The callback must not take mu: WASAPI and Core Audio prefill their first
+	// device buffers synchronously from inside dev.Start(), i.e. the callback
+	// runs on the goroutine that holds mu in Start. Reading State() there would
+	// lock the same mutex again and deadlock before any audio ever reaches the
+	// device (Windows/macOS only; PipeWire signals from its own loop thread).
+	running atomic.Bool
 }
 
 // data runs on the OS audio thread: no allocation, no blocking, no logging.
@@ -232,7 +239,7 @@ func (s *session) data(out, _ []byte, frames uint32) {
 	if n == 0 {
 		return
 	}
-	if s.paused.Load() || s.State() != output.StateRunning {
+	if s.paused.Load() || !s.running.Load() {
 		clear(out)
 		return
 	}
@@ -258,7 +265,12 @@ func (s *session) Start() error {
 		return nil
 	}
 	s.paused.Store(false)
+	// Mark the session audible *before* dev.Start: both backends prefill the
+	// first buffers from inside start(), so the data callback runs on this
+	// goroutine while mu is held. It must see a runnable session there.
+	s.running.Store(true)
 	if err := s.dev.Start(); err != nil {
+		s.running.Store(false)
 		return err
 	}
 	s.state = output.StateRunning
@@ -296,6 +308,7 @@ func (s *session) stopLocked() error {
 		return output.ErrClosed
 	}
 	s.paused.Store(true)
+	s.running.Store(false)
 	if s.state == output.StateRunning {
 		if err := s.dev.Stop(); err != nil && !errors.Is(err, audiogo.ErrDeviceNotInitialized) {
 			return err
@@ -312,6 +325,7 @@ func (s *session) Close() error {
 	if s.state == output.StateClosed {
 		return nil
 	}
+	s.running.Store(false)
 	if s.state == output.StateRunning {
 		if err := s.dev.Stop(); err != nil && !errors.Is(err, audiogo.ErrDeviceNotInitialized) {
 			s.Logf("stop before close: %v", err)

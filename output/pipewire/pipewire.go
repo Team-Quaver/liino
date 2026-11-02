@@ -127,6 +127,11 @@ type session struct {
 	mu     sync.Mutex
 	state  output.State
 	paused atomic.Bool
+	// running mirrors state == output.StateRunning for the loop-thread
+	// callback. The callback must never take mu: Start/Stop hold it while the
+	// graph is (re)scheduled, and blocking that thread is an audible gap at
+	// best, a lock-order inversion at worst.
+	running atomic.Bool
 }
 
 // fill runs on the PipeWire loop thread: copy frames into the planar graph
@@ -135,7 +140,7 @@ func (s *session) fill(buf *pw.PCMBuffer) (int, error) {
 	if buf == nil || buf.Frames <= 0 {
 		return 0, nil
 	}
-	if s.paused.Load() || s.State() != output.StateRunning {
+	if s.paused.Load() || !s.running.Load() {
 		for _, row := range buf.Samples {
 			clear(row)
 		}
@@ -154,7 +159,9 @@ func (s *session) Start() error {
 		return nil
 	}
 	s.paused.Store(false)
+	s.running.Store(true)
 	if err := s.player.Start(); err != nil {
+		s.running.Store(false)
 		return err
 	}
 	s.state = output.StateRunning
@@ -190,6 +197,7 @@ func (s *session) stopLocked() error {
 		return output.ErrClosed
 	}
 	s.paused.Store(true)
+	s.running.Store(false)
 	if s.state == output.StateRunning {
 		if err := s.player.Stop(); err != nil {
 			return err
@@ -205,6 +213,7 @@ func (s *session) Close() error {
 	if s.state == output.StateClosed {
 		return nil
 	}
+	s.running.Store(false)
 	err := s.player.Close()
 	s.state = output.StateClosed
 	return err
