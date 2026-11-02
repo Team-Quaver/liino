@@ -80,10 +80,33 @@ func (backend) Supports(src decode.Source) (bool, string) {
 }
 
 func (backend) Probe() (ok bool, note string) {
-	if objc.GetClass("AVAssetReader") == 0 {
-		return false, "avf: AVFoundation is not available"
+	if err := ensureFramework(); err != nil {
+		return false, "avf: AVFoundation is not available: " + err.Error()
 	}
 	return true, "AVFoundation / CoreMedia"
+}
+
+var (
+	frameworkOnce sync.Once
+	frameworkErr  error
+)
+
+// ensureFramework dlopens AVFoundation before the first class lookup.
+//
+// objc.GetClass only sees classes from images the process has already loaded.
+// Liino is a pure-Go binary (no cgo, nothing links AVFoundation), so on a fresh
+// launch the framework is not loaded yet and asking for AVAssetReader directly
+// returns 0 - making this backend look unavailable even though macOS can run
+// it. The generated constant accessor triggers the bindings' one-time
+// dlopen(AVFoundation) as a side effect.
+func ensureFramework() error {
+	frameworkOnce.Do(func() {
+		avfoundation.AVMediaTypeAudio()
+		if objc.GetClass("AVAssetReader") == 0 {
+			frameworkErr = errors.New("AVAssetReader is not registered")
+		}
+	})
+	return frameworkErr
 }
 
 func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options) (decode.Stream, error) {
@@ -92,6 +115,9 @@ func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if err := ensureFramework(); err != nil {
+		return nil, fmt.Errorf("%w: AVFoundation: %v", decode.ErrUnavailable, err)
 	}
 
 	asset := newAsset(src.URI)

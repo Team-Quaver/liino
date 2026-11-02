@@ -58,12 +58,18 @@ func (s *stream) Format() pcm.Format { return s.chunk.Format }
 func (s *stream) Meta() decode.Meta  { return s.meta }
 
 func (s *stream) Read() (pcm.Chunk, error) {
-	release, err := comInit()
-	if err != nil {
-		return pcm.Chunk{}, err
+	var (
+		chunk pcm.Chunk
+		err   error
+	)
+	if werr := worker.do(func() { chunk, err = s.read() }); werr != nil {
+		return pcm.Chunk{}, werr
 	}
-	defer release()
+	return chunk, err
+}
 
+// read is Read's body, running on the Media Foundation MTA thread.
+func (s *stream) read() (pcm.Chunk, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -172,12 +178,18 @@ func (s *stream) emit(buf []float32, frames int) pcm.Chunk {
 }
 
 func (s *stream) Seek(t time.Duration) (time.Duration, error) {
-	release, err := comInit()
-	if err != nil {
-		return 0, err
+	var (
+		at  time.Duration
+		err error
+	)
+	if werr := worker.do(func() { at, err = s.seek(t) }); werr != nil {
+		return 0, werr
 	}
-	defer release()
+	return at, err
+}
 
+// seek is Seek's body, running on the Media Foundation MTA thread.
+func (s *stream) seek(t time.Duration) (time.Duration, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -201,22 +213,26 @@ func (s *stream) Seek(t time.Duration) (time.Duration, error) {
 }
 
 func (s *stream) Close() error {
-	release, _ := comInit()
-	if release != nil {
-		defer release()
+	// A stream only exists after a successful Open, i.e. after the worker
+	// started; a failed start means there is nothing to release.
+	if err := worker.start(); err != nil {
+		return nil
 	}
+	return worker.do(s.close)
+}
 
+// close is Close's body, running on the Media Foundation MTA thread.
+func (s *stream) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil
+		return
 	}
 	s.closed = true
 	if s.reader != nil {
 		s.reader.Release()
 		s.reader = nil
 	}
-	return nil
 }
 
 // propVariant mirrors the 24-byte ProPVARIANT layout: vt + three reserved

@@ -19,13 +19,10 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"sync"
 
 	"github.com/deploymenttheory/go-bindings-win32/bindings/runtime/win32"
 	"github.com/deploymenttheory/go-bindings-win32/bindings/win32/media/mediafoundation"
-	"github.com/deploymenttheory/go-bindings-win32/bindings/win32/system/com"
 
 	"github.com/team-quaver/liino/decode"
 )
@@ -77,7 +74,7 @@ func (backend) Probe() (ok bool, note string) {
 			ok, note = false, fmt.Sprintf("media foundation: %v", r)
 		}
 	}()
-	if err := ensureMF(); err != nil {
+	if err := worker.start(); err != nil {
 		return false, "media foundation: " + err.Error()
 	}
 	return true, "Media Foundation (Source Reader)"
@@ -87,17 +84,30 @@ func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options)
 	if src.Reader != nil {
 		return nil, fmt.Errorf("%w: wmf needs a URL", decode.ErrUnsupported)
 	}
-	if err := ensureMF(); err != nil {
+	if err := worker.start(); err != nil {
 		return nil, fmt.Errorf("%w: media foundation: %v", decode.ErrUnavailable, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	release, err := comInit()
-	if err != nil {
-		return nil, fmt.Errorf("%w: com: %v", decode.ErrUnavailable, err)
+
+	// Every COM/MF call runs on the worker's MTA thread; see mta.go. The
+	// caller's thread may well be the host's STA UI thread.
+	var (
+		st  decode.Stream
+		err error
+	)
+	if werr := worker.do(func() { st, err = openSource(ctx, src) }); werr != nil {
+		return nil, fmt.Errorf("%w: media foundation: %v", decode.ErrUnavailable, werr)
 	}
-	defer release()
+	return st, err
+}
+
+// openSource is Open's body, running on the Media Foundation MTA thread.
+func openSource(ctx context.Context, src decode.Source) (decode.Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	uri, err := sourceURL(src.URI)
 	if err != nil {
@@ -225,68 +235,6 @@ const (
 	allStreamsIndex  = uint32(0xFFFFFFFE) // MF_SOURCE_READER_ALL_STREAMS (-2)
 	mediaSourceIndex = uint32(0xFFFFFFFF) // MF_SOURCE_READER_MEDIASOURCE (-1)
 )
-
-var (
-	mfOnce  sync.Once
-	mfErr   error
-	mtaOnce sync.Once
-	mtaKeep = make(chan struct{})
-)
-
-// ensureMF starts Media Foundation once per process. MFStartup is reference
-// counted; Liino never calls MFShutdown because the host process owns the
-// lifetime of every stream.
-func ensureMF() error {
-	mfOnce.Do(func() {
-		ensureMTA()
-		mfErr = safeCall(func() error {
-			return mediafoundation.MFStartup(mediafoundation.MF_VERSION, mediafoundation.MFSTARTUP_FULL)
-		})
-	})
-	return mfErr
-}
-
-// ensureMTA keeps one multithreaded-apartment thread alive for the process.
-//
-// comInit balances every CoInitializeEx with CoUninitialize, so without a
-// permanent reference COM would tear the MTA down between calls while source
-// reader objects are still alive. Audio streams outlive any single FFI call,
-// hence the keeper goroutine.
-func ensureMTA() {
-	mtaOnce.Do(func() {
-		go func() {
-			runtime.LockOSThread()
-			_, _ = com.CoInitializeEx(uint32(com.COINIT_MULTITHREADED))
-			<-mtaKeep
-		}()
-	})
-}
-
-// comInit enters the multithreaded apartment and pins the goroutine to its OS
-// thread for the duration of the call. COM is thread-associated, so every
-// source-reader call is wrapped; an MTA object may then be used by any MTA
-// thread the Go scheduler picks.
-func comInit() (release func(), err error) {
-	runtime.LockOSThread()
-	hr, err := com.CoInitializeEx(uint32(com.COINIT_MULTITHREADED))
-	if err != nil {
-		runtime.UnlockOSThread()
-		return nil, fmt.Errorf("CoInitializeEx: %w (hr=0x%08x)", err, uint32(hr))
-	}
-	return func() {
-		com.CoUninitialize()
-		runtime.UnlockOSThread()
-	}, nil
-}
-
-func safeCall(fn func() error) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("%v", r)
-		}
-	}()
-	return fn()
-}
 
 // sourceURL turns a local path or file:// URI into the URL form the Source
 // Reader expects; http(s) and other schemes pass through untouched.
