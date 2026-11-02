@@ -68,17 +68,25 @@ func sharedContext(kind audiogo.Backend, logf func(string)) (*audiogo.AllocatedC
 
 // Shutdown releases every cached context. Call it on process teardown only.
 func Shutdown() {
-	ctxMu.Lock()
-	defer ctxMu.Unlock()
-	for kind, ac := range ctxs {
-		_ = ac.Uninit()
-		ac.Free()
-		delete(ctxs, kind)
-	}
+	_ = serial(func() {
+		ctxMu.Lock()
+		defer ctxMu.Unlock()
+		for kind, ac := range ctxs {
+			_ = ac.Uninit()
+			ac.Free()
+			delete(ctxs, kind)
+		}
+	})
 }
 
 func (d *driver) Probe() (bool, string) {
-	ac, err := sharedContext(d.kind, nil)
+	var (
+		ac  *audiogo.AllocatedContext
+		err error
+	)
+	if werr := serial(func() { ac, err = sharedContext(d.kind, nil) }); werr != nil {
+		return false, werr.Error()
+	}
 	if err != nil {
 		return false, err.Error()
 	}
@@ -87,27 +95,38 @@ func (d *driver) Probe() (bool, string) {
 
 // Devices lists render endpoints.
 func (d *driver) Devices() ([]output.Device, error) {
-	ac, err := sharedContext(d.kind, nil)
-	if err != nil {
-		return nil, err
+	var (
+		out []output.Device
+		err error
+	)
+	werr := serial(func() {
+		var ac *audiogo.AllocatedContext
+		ac, err = sharedContext(d.kind, nil)
+		if err != nil {
+			return
+		}
+		var raw []audiogo.DeviceInfo
+		raw, err = ac.Devices(audiogo.Playback)
+		if err != nil {
+			return
+		}
+		out = make([]output.Device, 0, len(raw))
+		for _, dev := range raw {
+			id := dev.ID.String()
+			out = append(out, output.Device{
+				ID:      id,
+				Driver:  d.name,
+				Name:    fallback(dev.Name(), id),
+				Default: dev.IsDefault != 0,
+				Native:  id,
+				Formats: nativeFormats(dev.Formats),
+			})
+		}
+	})
+	if werr != nil {
+		return nil, werr
 	}
-	raw, err := ac.Devices(audiogo.Playback)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]output.Device, 0, len(raw))
-	for _, dev := range raw {
-		id := dev.ID.String()
-		out = append(out, output.Device{
-			ID:      id,
-			Driver:  d.name,
-			Name:    fallback(dev.Name(), id),
-			Default: dev.IsDefault != 0,
-			Native:  id,
-			Formats: nativeFormats(dev.Formats),
-		})
-	}
-	return out, nil
+	return out, err
 }
 
 func nativeFormats(formats []audiogo.DataFormat) []pcm.Format {
@@ -130,6 +149,20 @@ func fallback(a, b string) string {
 
 // Open creates a render session on the requested, or default, endpoint.
 func (d *driver) Open(opts output.Options) (output.Output, error) {
+	var (
+		out output.Output
+		err error
+	)
+	if werr := serial(func() { out, err = d.open(opts) }); werr != nil {
+		return nil, werr
+	}
+	return out, err
+}
+
+// open is Open's body, running on the COM worker. All the audio-go calls below
+// create or drive apartment-bound objects, so they must not run on a host UI
+// thread that COM initialized as STA.
+func (d *driver) open(opts output.Options) (output.Output, error) {
 	ac, err := sharedContext(d.kind, opts.Log)
 	if err != nil {
 		return nil, err
@@ -269,7 +302,12 @@ func (s *session) Start() error {
 	// first buffers from inside start(), so the data callback runs on this
 	// goroutine while mu is held. It must see a runnable session there.
 	s.running.Store(true)
-	if err := s.dev.Start(); err != nil {
+	var err error
+	if werr := serial(func() { err = s.dev.Start() }); werr != nil {
+		s.running.Store(false)
+		return werr
+	}
+	if err != nil {
 		s.running.Store(false)
 		return err
 	}
@@ -310,7 +348,11 @@ func (s *session) stopLocked() error {
 	s.paused.Store(true)
 	s.running.Store(false)
 	if s.state == output.StateRunning {
-		if err := s.dev.Stop(); err != nil && !errors.Is(err, audiogo.ErrDeviceNotInitialized) {
+		var err error
+		if werr := serial(func() { err = s.dev.Stop() }); werr != nil {
+			return werr
+		}
+		if err != nil && !errors.Is(err, audiogo.ErrDeviceNotInitialized) {
 			return err
 		}
 	}
@@ -326,12 +368,19 @@ func (s *session) Close() error {
 		return nil
 	}
 	s.running.Store(false)
-	if s.state == output.StateRunning {
-		if err := s.dev.Stop(); err != nil && !errors.Is(err, audiogo.ErrDeviceNotInitialized) {
-			s.Logf("stop before close: %v", err)
+	var stopErr error
+	werr := serial(func() {
+		if s.state == output.StateRunning {
+			stopErr = s.dev.Stop()
 		}
+		s.dev.Uninit()
+	})
+	if werr == nil && stopErr != nil && !errors.Is(stopErr, audiogo.ErrDeviceNotInitialized) {
+		s.Logf("stop before close: %v", stopErr)
 	}
-	s.dev.Uninit()
+	if werr != nil {
+		s.Logf("close on the COM worker: %v", werr)
+	}
 	s.state = output.StateClosed
 	return nil
 }

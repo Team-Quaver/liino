@@ -201,10 +201,12 @@ func (s *stream) seek(t time.Duration) (time.Duration, error) {
 	if t < 0 {
 		t = 0
 	}
-	// kCMTimeFormat / GUID_NULL means "100-nanosecond units", which is what
-	// PROPVARIANT VT_I8 carries below.
+	// GUID_NULL means "100-nanosecond units", which is what PROPVARIANT VT_I8
+	// carries below. Pass a pointer to the nil GUID, not a nil pointer:
+	// MFSourceReader dereferences pguidTimeFormat, so NULL crashes the process.
+	timeFormat := win32.GUID{}
 	pv := propVariantInt64(int64(t / (100 * time.Nanosecond)))
-	if err := s.reader.SetCurrentPosition(nil, (*comstorage.PROPVARIANT)(unsafe.Pointer(&pv))); err != nil {
+	if err := s.reader.SetCurrentPosition(&timeFormat, (*comstorage.PROPVARIANT)(unsafe.Pointer(&pv))); err != nil {
 		return 0, fmt.Errorf("wmf: seek: %w", err)
 	}
 	_ = s.reader.Flush(audioStreamIndex)

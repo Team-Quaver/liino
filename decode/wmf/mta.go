@@ -6,10 +6,21 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/deploymenttheory/go-bindings-win32/bindings/win32/media/mediafoundation"
 	"github.com/deploymenttheory/go-bindings-win32/bindings/win32/system/com"
 )
+
+// rpcEChangedMode is COM's RPC_E_CHANGED_MODE: CoInitializeEx was called with
+// a different apartment model than the one the thread already joined.
+const rpcEChangedMode = 0x80010106
+
+// mtaInitAttempts bounds how many threads the worker will try before giving up.
+// Only host-created threads can be in the STA, and the Go runtime creates every
+// other thread, so a retry almost always lands on a clean one; the cap keeps a
+// pathological host from spinning forever.
+const mtaInitAttempts = 4
 
 // mta owns the one OS thread that talks to Media Foundation.
 //
@@ -42,19 +53,46 @@ func (m *mta) start() error {
 	m.once.Do(func() {
 		m.ready = make(chan struct{})
 		m.jobs = make(chan func(), 16)
-		go m.run()
+		go m.run(1)
 	})
 	<-m.ready
 	return m.initErr
 }
 
-func (m *mta) run() {
+// run initializes one candidate OS thread and, once COM accepts the MTA,
+// serves jobs forever. attempt counts the threads tried so far.
+//
+// A goroutine can start life on an OS thread the host already initialized as
+// STA (the MyGo UI thread, or the Electron browser thread when an FFI call
+// brings control into Go). CoInitializeEx then fails with RPC_E_CHANGED_MODE.
+// That is not a dead end: unlock the thread, return it to the Go pool, and try
+// again from a fresh goroutine. All non-host threads are uninitialized, so a
+// bounded number of retries is enough even on a single-P machine.
+func (m *mta) run(attempt int) {
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	locked := true
+	defer func() {
+		if locked {
+			runtime.UnlockOSThread()
+		}
+	}()
 
 	hr, err := com.CoInitializeEx(uint32(com.COINIT_MULTITHREADED))
 	if err != nil {
-		m.initErr = fmt.Errorf("CoInitializeEx(MTA): %w (hr=0x%08x)", err, uint32(hr))
+		if uint32(hr) == rpcEChangedMode && attempt < mtaInitAttempts {
+			// Do not let a locked goroutine exit: the runtime terminates the
+			// thread, and this one may be the host's UI thread. Hand it back to
+			// the pool, then let the replacement start after a short pause so
+			// the scheduler is unlikely to put it back on the same thread.
+			locked = false
+			runtime.UnlockOSThread()
+			go func() {
+				time.Sleep(time.Millisecond)
+				m.run(attempt + 1)
+			}()
+			return
+		}
+		m.initErr = fmt.Errorf("CoInitializeEx(MTA): %w (hr=0x%08x, attempt %d)", err, uint32(hr), attempt)
 		close(m.ready)
 		return
 	}
