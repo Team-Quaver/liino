@@ -513,6 +513,11 @@ func (p *Player) startDevice() {
 		out = p.out
 		p.mu.Unlock()
 	}
+	// Close or a device rebuild can drop the session between ensureOutput
+	// returning and this read; starting nothing is the correct, silent outcome.
+	if out == nil {
+		return
+	}
 	if err := out.Start(); err != nil {
 		p.fail(fmt.Errorf("output start: %w", err))
 		return

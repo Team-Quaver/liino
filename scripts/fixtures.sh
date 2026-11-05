@@ -27,6 +27,13 @@ ffmpeg -v error -y -f lavfi -i "$(tone '.3*sin(2*PI*880*t)' 96000 2)" \
 ffmpeg -v error -y -f lavfi -i "$(tone '.25*sin(2*PI*220*t)|.25*sin(2*PI*330*t)' 48000 2)" \
 	-ac 2 -channel_layout stereo -c:a libvorbis -q 5 "$dir/tone-48000-stereo.ogg"
 
+# VBR FLAC: 8 s of silence then a loud tone. Seeking into the quiet lead-in
+# with an average-bitrate estimate lands far past the target; the byte seek
+# must correct its offset instead of falling back to the demuxer's timestamp
+# search (which costs one Range round trip per probe).
+ffmpeg -v error -y -f lavfi -i "$(tone 'if(lt(t\,8)\,0\,0.5*sin(2*PI*440*t))' 44100 20)" \
+	-ac 2 -channel_layout stereo -c:a flac "$dir/tone-vbr.flac"
+
 # 5.1 FLAC: exercises the multichannel path.
 ffmpeg -v error -y -f lavfi -i \
 	"$(tone '.15*sin(2*PI*220*t)|.15*sin(2*PI*330*t)|.15*sin(2*PI*440*t)|.15*sin(2*PI*550*t)|.15*sin(2*PI*660*t)|.15*sin(2*PI*770*t)' 48000 2)" \

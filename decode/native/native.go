@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -252,6 +253,12 @@ type resampleFrom struct {
 func (s *stream) Format() pcm.Format { return s.chunk.Format }
 func (s *stream) Meta() decode.Meta  { return s.meta }
 
+func (s *stream) logf(format string, args ...any) {
+	if s.log != nil {
+		s.log(fmt.Sprintf(format, args...))
+	}
+}
+
 // Read returns the next decoded chunk. The buffer is owned by the stream and
 // stays valid until the following Read.
 func (s *stream) Read() (pcm.Chunk, error) {
@@ -469,11 +476,19 @@ const maxDiscardFrames = 512
 // Byte-seek landing windows. Overshoot cannot be fixed by decoding (audio
 // only moves forward), so a landing past the target is only accepted when it
 // is imperceptibly late. Undershoot is covered by decoding forward, bounded by
-// a budget so a wrong estimate (VBR) falls back instead of grinding through
+// a budget so a wrong estimate (VBR) is corrected instead of grinding through
 // tens of seconds of audio.
 const (
 	byteSeekOvershoot = 500 * time.Millisecond
 	byteSeekForward   = 5 * time.Second
+	// maxByteSeekTries bounds the corrective re-jumps. Each attempt costs one
+	// Range read and a few decoded frames; the demuxer's timestamp fallback it
+	// avoids costs log2(file size) round trips (24 on a 30 MB track), which is
+	// what made a seek on a relayed FLAC stall for seconds.
+	maxByteSeekTries = 3
+	// byteSeekMaxMiss is how far the measured landing may be from the target
+	// before its PTS is treated as untrustworthy and the accurate path is used.
+	byteSeekMaxMiss = 2 * time.Minute
 )
 
 // demuxerKeepsAbsolutePTS reports whether a demuxer can still label packets
@@ -490,11 +505,69 @@ func demuxerKeepsAbsolutePTS(name string) bool {
 // Range round trip per probe (~log2(file size)); on a remote CDN that is what
 // made a lyric click take seconds. A byte jump is one request, and the exact
 // PTS is reached by decoding forward the short remaining gap.
+//
+// The estimate uses the file's average bitrate, so a VBR passage (a quiet
+// intro, a loud chorus) can land past the target. Audio cannot be decoded
+// backwards, and falling back to the demuxer's timestamp search there is the
+// slow path this function exists to avoid: it measured 24 Range reads on a
+// 30 MB FLAC, i.e. seconds on a relayed source. The landing PTS tells us how
+// far off we are, so jump again at a corrected offset instead.
 func (s *stream) seekByByte(t time.Duration) error {
-	off := int64(t.Seconds() * float64(s.byteRate))
+	rate := float64(s.byteRate)
+	off := int64(t.Seconds() * rate)
 	if off < 0 {
 		off = 0
 	}
+	for try := 0; try < maxByteSeekTries; try++ {
+		if err := s.byteJump(off); err != nil {
+			return err
+		}
+		pos, frame, landed, err := s.landAt(t)
+		if err != nil {
+			return err
+		}
+		if landed {
+			s.pending, s.hasPend = frame, true
+			return nil
+		}
+		miss := pos.Seconds() - t.Seconds()
+		if math.Abs(miss) > byteSeekMaxMiss.Seconds() {
+			return fmt.Errorf("decode native: byte seek landed %.1fs from target", miss)
+		}
+		// Correct by the measured miss, converted with the same average rate.
+		// A late landing (miss > 0) consumed too many bytes, so the offset
+		// moves back; an early one moves forward. On a VBR file the local rate
+		// at the landing differs from the average, so this can still miss by a
+		// fraction; the next try converges.
+		next := off - int64(miss*rate)
+		if next < 0 {
+			next = 0
+		}
+		if next == off {
+			// The correction rounded away; nudge by ~100 ms of audio so the
+			// loop can make progress instead of retrying the same offset.
+			step := int64(rate / 10)
+			if step <= 0 {
+				step = 1
+			}
+			if miss > 0 {
+				next = off - step
+			} else {
+				next = off + step
+			}
+			if next < 0 {
+				next = 0
+			}
+		}
+		s.logf("decode native: byte seek landed %.3fs off target; retrying at %d", miss, next)
+		off = next
+	}
+	return errors.New("decode native: byte seek did not converge")
+}
+
+// byteJump repositions the demuxer to an absolute byte offset and drops all
+// decoder/resampler state from the previous position.
+func (s *stream) byteJump(off int64) error {
 	if err := s.dec.SeekByte(off); err != nil {
 		return err
 	}
@@ -505,55 +578,63 @@ func (s *stream) seekByByte(t time.Duration) error {
 	}
 	s.dec.FlushDecoder()
 	s.pending, s.hasPend = ffgo.Frame{}, false
-	return s.discardTo(t)
+	return nil
 }
 
-// discardTo decodes forward from a byte seek until the frame at/after t, and
-// reports whether that landing is trustworthy. Any doubt (no timestamps, a
-// large miss, EOF before the target) returns an error so the caller can fall
-// back to the demuxer's accurate search instead of playing the wrong audio.
-func (s *stream) discardTo(t time.Duration) error {
+// landAt decodes forward from the current byte position to the first frame at
+// or after t, and reports whether that landing is trustworthy. A miss returns
+// the position actually reached so seekByByte can correct its byte estimate.
+// Any doubt (no timestamps, EOF, a huge miss) returns an error so the caller
+// falls back to the demuxer's accurate search instead of playing wrong audio.
+func (s *stream) landAt(t time.Duration) (time.Duration, ffgo.Frame, bool, error) {
 	target := t.Seconds()
 	overshoot := byteSeekOvershoot.Seconds()
 	forward := byteSeekForward.Seconds()
 	first := -1.0
+	last := -1.0
 	for i := 0; i < maxDiscardFrames; i++ {
 		frame, err := s.dec.DecodeAudio()
 		if err != nil {
 			if errors.Is(err, io.EOF) || ffgo.IsEOF(err) {
-				return errors.New("decode native: byte seek ran past end of stream")
+				// Ran past the tail: the offset is too late. Treat it as a
+				// forward miss so the next try jumps back.
+				return t + byteSeekForward, ffgo.Frame{}, false, nil
 			}
 			if avutil.IsInvalidData(err) {
 				continue // a byte offset can land mid-frame; resync forward
 			}
-			return err
+			return 0, ffgo.Frame{}, false, err
 		}
 		if frame.IsNil() {
-			return errors.New("decode native: byte seek decoded no frame")
+			return t + byteSeekForward, ffgo.Frame{}, false, nil
 		}
 		w := ffgo.WrapFrame(frame, ffgo.MediaTypeAudio)
 		pts := w.PTS()
 		if pts == avutil.AV_NOPTS_VALUE {
-			return errors.New("decode native: byte seek frame has no timestamp")
+			return 0, ffgo.Frame{}, false, errors.New("decode native: byte seek frame has no timestamp")
 		}
 		pos := s.ptsSeconds(pts)
 		if first < 0 {
 			first = pos
 		}
+		last = pos
+		at := time.Duration(pos * float64(time.Second))
 		if pos >= target {
 			if pos-target > overshoot {
-				return fmt.Errorf("decode native: byte seek overshot by %.3fs", pos-target)
+				return at, ffgo.Frame{}, false, nil
 			}
-			s.pending, s.hasPend = frame, true
-			return nil
+			return at, frame, true, nil
 		}
 		if pos-first > forward {
 			// Decoded further than the budget without reaching the target: the
-			// bitrate estimate is wrong for this source; use the accurate path.
-			return fmt.Errorf("decode native: byte seek still %.3fs short", target-pos)
+			// bitrate estimate is low for this source; correct it.
+			return at, ffgo.Frame{}, false, nil
 		}
 	}
-	return errors.New("decode native: byte seek did not reach the target")
+	if last < 0 {
+		return t + byteSeekForward, ffgo.Frame{}, false, nil
+	}
+	return time.Duration(last * float64(time.Second)), ffgo.Frame{}, false, nil
 }
 
 // ptsSeconds converts a demuxer PTS to seconds. Packet timestamps are in the

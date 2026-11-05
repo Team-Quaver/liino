@@ -20,6 +20,7 @@ import (
 type fakeBackend struct {
 	mu      sync.Mutex
 	opened  int
+	streams []*fakeStream
 	failErr error
 	seekErr error
 	// seekErrOnOpen makes only the stream from this 1-based Open reject seeks,
@@ -82,7 +83,18 @@ func (b *fakeBackend) Open(context.Context, decode.Source, decode.Options) (deco
 		s.readErr = errors.New("connection reset by peer")
 		s.readAfter = b.readErrAfter
 	}
+	b.streams = append(b.streams, s)
 	return s, nil
+}
+
+// streamAt returns the nth opened stream, or nil.
+func (b *fakeBackend) streamAt(n int) *fakeStream {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n < 0 || n >= len(b.streams) {
+		return nil
+	}
+	return b.streams[n]
 }
 
 func (s *fakeStream) Format() pcm.Format { return pcm.DefaultFormat() }
@@ -128,6 +140,12 @@ func (s *fakeStream) Close() error {
 	defer s.mu.Unlock()
 	s.closed = true
 	return nil
+}
+
+func (s *fakeStream) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 func registerFake(t *testing.T, b *fakeBackend) {
@@ -482,6 +500,47 @@ func (b *lateBackend) Open(ctx context.Context, src decode.Source, _ decode.Opti
 		Codec: "late", SampleRate: pcm.DefaultSampleRate, Channels: pcm.DefaultChannels,
 		Duration: 2 * time.Second, Seekable: true,
 	}}, nil
+}
+
+// A load owns the previous decoder: the old decode goroutine retires without
+// closing anything, so Open must take the stream away and close it. Before
+// this, every skip leaked a decoder and its HTTP connection, and a skipped
+// source could keep a relayed download open for the life of the process.
+func TestLoadClosesPreviousStream(t *testing.T) {
+	fake := &fakeBackend{}
+	registerFake(t, fake)
+
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(128)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://first"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 2*time.Second)
+	first := fake.streamAt(0)
+	if first == nil {
+		t.Fatal("first stream was not opened")
+	}
+	if first.isClosed() {
+		t.Fatal("first stream closed while it was the active one")
+	}
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://second"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if first.isClosed() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("previous decoder was not closed when a new load replaced it")
 }
 
 func TestPlayerVolumeAndEQ(t *testing.T) {

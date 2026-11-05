@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -424,6 +425,53 @@ func TestDecodeByteSeekOverHTTP(t *testing.T) {
 	// The fixture is 2 s long: seeking to 1.5 s leaves ~0.5 s of audio.
 	want := int(0.5 * pcm.DefaultSampleRate)
 	if diff := absInt(frames - want); diff > pcm.DefaultSampleRate/3 {
+		t.Fatalf("tail frames = %d, want ~%d", frames, want)
+	}
+}
+
+// TestDecodeByteSeekCorrectsVBROvershoot covers the relayed-FLAC seek path.
+// The byte offset comes from the file's average bitrate, so a target in a
+// quiet passage (the fixture's first 8 s) lands well past it: FLAC is VBR, and
+// the lead-in consumes far fewer bytes per second than the rest. Audio cannot
+// be decoded backwards, and the old fallback was the demuxer's timestamp
+// search — one Range round trip per probe (24 on a 30 MB track), i.e. seconds
+// behind the host's /stream/ relay. The landing PTS is enough to correct the
+// offset, so a seek must stay within a couple of Range reads.
+func TestDecodeByteSeekCorrectsVBROvershoot(t *testing.T) {
+	path := fixture(t, "tone-vbr.flac")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ranges atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			ranges.Add(1)
+		}
+		http.ServeContent(w, r, "tone-vbr.flac", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+
+	s, err := (backend{}).Open(context.Background(), decode.Source{URI: srv.URL + "/stream/token"}, decode.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ns, ok := s.(*stream)
+	if !ok || !ns.byteSeek {
+		t.Fatal("byte seek path not enabled for an http FLAC source")
+	}
+	ranges.Store(0)
+	if _, err := s.Seek(4 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := ranges.Load(); got > 3 {
+		t.Fatalf("seek issued %d Range reads, want <= 3 (fell back to the timestamp search)", got)
+	}
+	frames, _, _ := drain(t, s)
+	// The fixture is 20 s; seeking to 4 s leaves 16 s.
+	want := 16 * pcm.DefaultSampleRate
+	if diff := absInt(frames - want); diff > pcm.DefaultSampleRate {
 		t.Fatalf("tail frames = %d, want ~%d", frames, want)
 	}
 }

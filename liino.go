@@ -282,13 +282,25 @@ func (p *Player) Open(ctx context.Context, src decode.Source, opts OpenOptions) 
 	p.decoded.Store(0)
 	p.clock = newClock(pcm.DefaultSampleRate)
 	p.clock.base = maxDuration(opts.StartAt, 0)
-	// A stale producer is cut off by the token swap; its own loop notices the
-	// generation change and closes its stream.
+	// A stale producer is cut off by the token swap and notices the generation
+	// change, but it no longer owns the stream: this load does. Take the old
+	// stream away and close it in the background, or every skip leaks a
+	// decoder and its HTTP connection (the abandoned Read can be parked for up
+	// to rw_timeout, so Close must not run on this path).
+	oldStream := p.stream
+	p.stream = nil
 	p.pipe.Load().Swap(gen)
 	p.chain.Reset()
 	p.nudge()
 	p.mu.Unlock()
 
+	if oldStream != nil {
+		p.decWG.Add(1)
+		go func() {
+			defer p.decWG.Done()
+			_ = oldStream.Close()
+		}()
+	}
 	p.decWG.Add(1)
 	go p.decodeLoop(ctx, gen, src, opts.StartAt)
 	return nil
