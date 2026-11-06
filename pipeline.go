@@ -131,8 +131,21 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 	// the network and can stall for seconds. Holding mu here blocks every FFI
 	// call the host makes on its UI thread (clock/snapshot/nextEvent) — the app
 	// window stays painted while the main process is frozen and silent.
-	if startAt > 0 && seekable {
-		if _, err := stream.Seek(startAt); err != nil {
+	if startAt > 0 {
+		if !seekable {
+			// The decoder cannot seek, so the audio will start at 0 no matter what
+			// the caller asked for. The clock has to follow: Open already placed it
+			// at startAt, and leaving it there is exactly the "progress bar sits on
+			// the breakpoint while playback restarts from the top" bug (WMF used to
+			// report unknown-length HTTP sources as unseekable).
+			p.logf("source is not seekable; starting from the beginning instead of %s", startAt)
+			p.mu.Lock()
+			if !p.closed && p.gen.curLoad() == gen {
+				p.clock.base = 0
+				p.base = 0
+			}
+			p.mu.Unlock()
+		} else if at, err := stream.Seek(startAt); err != nil {
 			_ = stream.Close()
 			if p.stale(gen) {
 				return
@@ -154,8 +167,27 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 				}
 				return
 			}
-			p.failGen(gen, fmt.Errorf("seek to start: %w", err))
+			// Retry budget spent. Last resort is an honest start from the top, not
+			// killing a track that can still play. reopenIf(0) leaves the clock at 0.
+			p.logf("initial seek to %s failed (%v); restarting from the beginning", startAt, err)
+			if rerr := p.reopenIf(gen, 0, 0, p.resumeIntent()); rerr != nil {
+				p.failGen(gen, rerr)
+			}
 			return
+		} else {
+			if p.stale(gen) {
+				_ = stream.Close()
+				return
+			}
+			// The decoder may land on an index point instead of the exact target.
+			// Use where it actually is as the clock base, or the progress bar leads
+			// the audio by however far the container rounded.
+			p.mu.Lock()
+			if !p.closed && p.gen.curLoad() == gen {
+				p.clock.base = at
+				p.base = at
+			}
+			p.mu.Unlock()
 		}
 	}
 
@@ -286,7 +318,7 @@ func (p *Player) applyPendingSeek(gen uint64, stream decode.Stream) bool {
 	// Drop whatever the previous position left buffered: the producer may have
 	// written a chunk between the Seek call and this point.
 	p.pipe.Load().Reset()
-	if _, err := stream.Seek(req.at); err != nil {
+	if at, err := stream.Seek(req.at); err != nil {
 		p.logf("in-place seek to %s failed: %v", req.at, err)
 		// A failed seek leaves the demuxer undefined; rebuild at the newest
 		// target instead of killing the track. If another drag arrived while
@@ -299,6 +331,16 @@ func (p *Player) applyPendingSeek(gen uint64, stream decode.Stream) bool {
 			p.failGen(gen, rerr)
 		}
 		return true
+	} else {
+		// Same as the initial seek: the container may land on an index point
+		// rather than the exact target. The clock was optimistically set to
+		// req.at above; pin it to what the decoder actually reached.
+		p.mu.Lock()
+		if !p.closed && p.gen.curLoad() == gen {
+			p.clock.base = at
+			p.base = at
+		}
+		p.mu.Unlock()
 	}
 	p.nudge()
 	p.logf("seeked to %s", req.at)

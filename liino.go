@@ -280,8 +280,9 @@ func (p *Player) Open(ctx context.Context, src decode.Source, opts OpenOptions) 
 	p.pending = nil
 	p.pulled.Store(0)
 	p.decoded.Store(0)
+	p.base = maxDuration(opts.StartAt, 0)
 	p.clock = newClock(pcm.DefaultSampleRate)
-	p.clock.base = maxDuration(opts.StartAt, 0)
+	p.clock.base = p.base
 	// A stale producer is cut off by the token swap and notices the generation
 	// change, but it no longer owns the stream: this load does. Take the old
 	// stream away and close it in the background, or every skip leaks a

@@ -205,18 +205,22 @@ func openSource(ctx context.Context, src decode.Source) (decode.Stream, error) {
 
 	dur := presentationDuration(reader)
 	live := src.IsLive()
+	// Seekability does not depend on the duration being known yet. MF_PD_DURATION is
+	// frequently unavailable right after opening an HTTP source (the media source has
+	// not parsed the far end of the file), while SetCurrentPosition still works over
+	// the byte stream. Treating "duration unknown" as "unseekable" made resume a
+	// silent no-op: the clock was placed at the breakpoint but decoding started at 0.
 	meta := decode.Meta{
 		Codec:      codecName(sub),
 		BitRate:    int64(avgBytes) * 8,
 		SampleRate: int(srcRate),
 		Channels:   int(srcCh),
 		Duration:   dur,
-		Seekable:   dur > 0 && !live,
+		Seekable:   !live,
 		Live:       live,
 	}
 	if live {
 		meta.Duration = 0
-		meta.Seekable = false
 	}
 	if meta.SampleRate <= 0 {
 		meta.SampleRate = int(rate)

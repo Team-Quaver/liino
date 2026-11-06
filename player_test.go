@@ -30,6 +30,9 @@ type fakeBackend struct {
 	// has produced readErrAfter frames (a CDN reset mid-song).
 	readErrOnOpen int
 	readErrAfter  int
+	// unseekable models a stream whose container has no index (live-ish HTTP):
+	// seeking is refused, so a resume offset cannot be honoured.
+	unseekable bool
 }
 
 type fakeStream struct {
@@ -70,7 +73,7 @@ func (b *fakeBackend) Open(context.Context, decode.Source, decode.Options) (deco
 			SampleRate: pcm.DefaultSampleRate,
 			Channels:   pcm.DefaultChannels,
 			Duration:   2 * time.Second,
-			Seekable:   true,
+			Seekable:   !b.unseekable,
 		},
 	}
 	switch {
@@ -381,6 +384,67 @@ func TestInitialSeekFailureReopensSource(t *testing.T) {
 	}
 	if snap := p.Snapshot(); snap.Position < 1450*time.Millisecond {
 		t.Fatalf("position after rebuilt initial seek = %s, want ~1.5s", snap.Position)
+	}
+}
+
+// A source that cannot seek must not claim the requested offset. Playback
+// starts at 0, so the clock has to follow it back to 0; otherwise the UI shows
+// the breakpoint while the audio restarts from the top (the Windows/WMF HTTP
+// resume bug).
+func TestUnseekableSourceStartsClockAtZero(t *testing.T) {
+	fake := &fakeBackend{unseekable: true}
+	registerFake(t, fake)
+
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(128)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{
+		AutoPlay: true,
+		StartAt:  1500 * time.Millisecond,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+
+	if snap := p.Snapshot(); snap.Position >= time.Second {
+		t.Fatalf("position = %s, want playback from 0 (source is not seekable)", snap.Position)
+	}
+}
+
+// When the seek retry budget is spent, a stream that still cannot seek must
+// fall back to playing from the top — not be declared dead. Otherwise a source
+// that advertises Seekable but rejects SetCurrentPosition (some HTTP servers)
+// turns every resume into "failed to play".
+func TestInitialSeekFailureFallsBackToStart(t *testing.T) {
+	fake := &fakeBackend{seekErr: errors.New("seek: range not satisfiable")}
+	registerFake(t, fake)
+
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(128)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{
+		AutoPlay: true,
+		StartAt:  1500 * time.Millisecond,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+
+	if snap := p.Snapshot(); snap.Position >= time.Second {
+		t.Fatalf("position = %s, want playback from 0 after the seek budget ran out", snap.Position)
+	}
+	if snap := p.Snapshot(); snap.State == StateFailed {
+		t.Fatalf("a playable track was declared failed: %s", snap.Error)
 	}
 }
 
