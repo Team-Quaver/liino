@@ -575,6 +575,7 @@ func (p *Player) onUnderrun() {
 		return
 	}
 	p.state = StateBuffering
+	p.bufferAt = p.pulled.Load()
 	p.mu.Unlock()
 	p.publish(Event{Kind: KindBuffering, Name: "buffering"})
 }
@@ -618,16 +619,21 @@ func (p *Player) evaluate() {
 	}
 
 	avail := p.pipe.Load().Available()
+	period := p.cfg.PeriodFrames
 	switch p.state {
 	case StateLoading, StateReady:
-		if p.wantPlay && (avail >= p.cfg.PrerollFrames || p.eof) {
+		// After an in-place seek the output session is already running. Waiting
+		// for the full preroll again is wrong there: WinRT produces at real
+		// time, so the pipe can stay below the preroll depth forever even while
+		// frames reach the device. Frames actually pulled are the truth.
+		if p.wantPlay && (avail >= p.cfg.PrerollFrames || p.eof || p.framesPulledSince(period)) {
 			p.state = StatePlaying
 			p.mu.Unlock()
 			p.startDevice()
 			return
 		}
 	case StateBuffering:
-		if avail >= p.cfg.PrerollFrames/2 {
+		if avail >= p.cfg.PrerollFrames/2 || p.framesPulledSince(period) {
 			p.state = StatePlaying
 			p.mu.Unlock()
 			p.publish(Event{Kind: KindReady, Name: "ready"})
@@ -642,17 +648,22 @@ func (p *Player) evaluate() {
 			p.finishLocked()
 			return
 		}
-		if avail == 0 && !p.eof {
-			p.state = StateBuffering
-			p.mu.Unlock()
-			p.publish(Event{Kind: KindBuffering, Name: "buffering"})
-			return
-		}
 	default:
 		p.mu.Unlock()
 		return
 	}
 	p.mu.Unlock()
+}
+
+// framesPulledSince reports whether the device has consumed at least one
+// period's worth of audio since the pipeline entered buffering. A device-side
+// underrun calls onUnderrun; this is the matching recovery signal for decoders
+// that produce at playback rate instead of filling the whole pipe.
+func (p *Player) framesPulledSince(period int) bool {
+	if period <= 0 {
+		period = pcm.ChunkFrames
+	}
+	return p.pulled.Load() >= p.bufferAt+uint64(period)
 }
 
 // finishLocked transitions to Ended; the caller must hold p.mu.

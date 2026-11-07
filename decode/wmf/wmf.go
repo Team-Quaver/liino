@@ -36,9 +36,10 @@ func init() { decode.Register(backend{}) }
 
 func (backend) Name() string { return Name }
 
-// Priority is highest: the OS decoder is the zero-dependency path, and it keeps
-// DRM-capable/codec-pack content working without shipping FFmpeg.
-func (backend) Priority() int { return 0 }
+// Priority is the Windows fallback: WinRT is tried first for the Store codec
+// pack and HTTP FLAC seeking, while the Source Reader still covers local
+// MP3/AAC/ALAC/FLAC/WMA and machines without the WinRT audio stack.
+func (backend) Priority() int { return 1 }
 
 // Codecs lists what the Windows codec pack is expected to provide. Actual
 // availability is per machine (N editions need the Media Feature Pack), so
@@ -203,6 +204,17 @@ func openSource(ctx context.Context, src decode.Source) (decode.Stream, error) {
 		ch = srcCh
 	}
 
+	codec := codecName(sub)
+	// Media Foundation's FLAC media source can open an HTTP(S) source and
+	// report its metadata, but the demuxer aborts on the first position change
+	// (SetCurrentPosition returns E_ABORT; the reader can fail the first Read
+	// too). Seeking is therefore broken for every HTTP FLAC track, and the
+	// player's retry ends up restarting it at 0. Hand these sources to WinRT's
+	// MediaSource, which decodes and seeks the same URL reliably.
+	if codec == "flac" && isHTTPSource(src.URI) {
+		return nil, fmt.Errorf("%w: wmf cannot seek FLAC over HTTP", decode.ErrUnsupported)
+	}
+
 	dur := presentationDuration(reader)
 	live := src.IsLive()
 	// Seekability does not depend on the duration being known yet. MF_PD_DURATION is
@@ -211,7 +223,7 @@ func openSource(ctx context.Context, src decode.Source) (decode.Stream, error) {
 	// the byte stream. Treating "duration unknown" as "unseekable" made resume a
 	// silent no-op: the clock was placed at the breakpoint but decoding started at 0.
 	meta := decode.Meta{
-		Codec:      codecName(sub),
+		Codec:      codec,
 		BitRate:    int64(avgBytes) * 8,
 		SampleRate: int(srcRate),
 		Channels:   int(srcCh),
@@ -282,6 +294,11 @@ func hasScheme(uri string) bool {
 		}
 	}
 	return true
+}
+
+func isHTTPSource(uri string) bool {
+	lower := strings.ToLower(uri)
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 // sourceExt returns the lower-case extension of a path or URL, if any.

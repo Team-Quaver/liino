@@ -448,6 +448,12 @@ func (x *iMediaSourceAudioInputNode) seek(ticks int64) error { // slot 9
 	return win32.ErrIfFailed(int32(r1))
 }
 
+func (x *iMediaSourceAudioInputNode) position() (int64, error) { // slot 8
+	var v int64
+	r1, _, _ := syscall.SyscallN(x.LpVtbl[8], uintptr(unsafe.Pointer(x)), uintptr(unsafe.Pointer(&v)))
+	return v, win32.ErrIfFailed(int32(r1))
+}
+
 func (x *iMediaSourceAudioInputNode) duration() (int64, error) { // slot 16
 	var v int64
 	r1, _, _ := syscall.SyscallN(x.LpVtbl[16], uintptr(unsafe.Pointer(x)), uintptr(unsafe.Pointer(&v)))

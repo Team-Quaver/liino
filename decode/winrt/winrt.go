@@ -37,9 +37,10 @@ func init() { decode.Register(backend{}) }
 
 func (backend) Name() string { return Name }
 
-// Priority is right after wmf: Media Foundation is still the cheaper path for
-// formats it can demux, and this backend picks up Ogg/Opus when it cannot.
-func (backend) Priority() int { return 1 }
+// Priority is highest on Windows: WinRT covers the Store codec pack (Ogg/Opus,
+// Web Media Extensions) and HTTP FLAC that Media Foundation's Source Reader
+// cannot seek. WMF remains the per-source fallback.
+func (backend) Priority() int { return 0 }
 
 // Codecs lists what this backend adds over the legacy Source Reader. Actual
 // availability depends on the Store codec pack, so Probe and the per-source

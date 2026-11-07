@@ -10,13 +10,14 @@
 //
 // Six backends ship with Liino:
 //
-//   - wmf: Windows Media Foundation's Source Reader (Windows only). It reaches
-//     the OS codec pack in-process, so MP3/AAC/FLAC/ALAC/WMA and anything else
-//     the machine already supports decode without shipping FFmpeg.
 //   - winrt: Windows.Media.Core/AudioGraph (Windows only). It reaches the
 //     Store codec package ("Web Media Extensions"), whose AppX media source
-//     the legacy Source Reader cannot activate; this is the path for Ogg
-//     Vorbis/Opus on Windows.
+//     the legacy Source Reader cannot activate. On Windows it is the default
+//     path (Store codecs, Ogg Vorbis/Opus, and HTTP FLAC seeking).
+//   - wmf: Windows Media Foundation's Source Reader (Windows only). It reaches
+//     the OS codec pack in-process, so MP3/AAC/FLAC/ALAC/WMA and anything else
+//     the machine already supports decode without shipping FFmpeg. It is the
+//     Windows fallback when WinRT cannot open the source.
 //   - avf: AVFoundation + CoreMedia (macOS only). AVAssetReader decodes through
 //     the same Core Audio codecs Finder/QuickTime use.
 //   - ogg: pure Go Ogg Vorbis/Opus (macOS only). AVFoundation has no Ogg

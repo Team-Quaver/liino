@@ -105,6 +105,7 @@ type stream struct {
 
 	durationFrames int64 // 0 when the container did not report a duration
 	queuedFrames   int64 // frames handed to the chunk queue since Open or Seek
+	seekFrames     int64 // source position of the first frame after Open or Seek
 	pending        []float32
 
 	running    bool
@@ -530,7 +531,7 @@ func (s *stream) pump() {
 	// ends, the tail can still be pending and the queue may have space again.
 	s.emitPending(false)
 
-	if s.durationFrames > 0 && s.queuedFrames >= s.durationFrames {
+	if s.durationFrames > 0 && s.seekFrames+s.queuedFrames >= s.durationFrames {
 		s.eof = true
 		if s.running {
 			_ = s.graph.stop()
@@ -548,7 +549,7 @@ func (s *stream) pump() {
 		s.stallTicks++
 		limit := stallLimit
 		if s.durationFrames > 0 {
-			if remain := s.durationFrames - s.queuedFrames; remain >= 0 && remain <= endSlackFrames {
+			if remain := s.durationFrames - s.seekFrames - s.queuedFrames; remain >= 0 && remain <= endSlackFrames {
 				limit = endStallTicks
 			}
 		}
@@ -822,10 +823,6 @@ func (s *stream) seek(t time.Duration) (time.Duration, error) {
 	if s.finished || s.graph == nil {
 		return 0, decode.ErrNotOpen
 	}
-	if s.running {
-		_ = s.graph.stop()
-		s.running = false
-	}
 	for {
 		select {
 		case <-s.chunks:
@@ -838,13 +835,32 @@ func (s *stream) seek(t time.Duration) (time.Duration, error) {
 	s.queuedFrames = 0
 	s.eof = false
 	s.stallTicks = 0
-	if s.frameNode != nil {
-		// Drop frames the output node buffered at the previous position.
-		_ = s.frameNode.reset()
+	// Keep the graph running across the position change: restarting a parked
+	// AudioGraph resets the media source to 0 and silently discards the Seek.
+	// Start it first when the pump had parked it because the queue was full.
+	if !s.running {
+		if err := s.graph.start(); err != nil {
+			return 0, fmt.Errorf("winrt: seek start graph: %w", err)
+		}
+		s.running = true
 	}
 	ticks := int64(t / (100 * time.Nanosecond))
 	if err := s.input.seek(ticks); err != nil {
 		return 0, fmt.Errorf("winrt: seek: %w", err)
+	}
+	// The container may land on an index point rather than the exact target.
+	// Track the actual origin so EOF accounting counts down from the seek
+	// target, not from 0 (otherwise the post-seek tail is treated as a full
+	// track and the clock runs past the end).
+	s.seekFrames = ticksToFrames(ticks)
+	if pos, err := s.input.position(); err == nil {
+		s.seekFrames = ticksToFrames(pos)
+	}
+	if s.frameNode != nil {
+		// Drop frames the output node buffered at the previous position. The
+		// reset must follow Seek: a running graph can emit one more quantum
+		// between the position change and this point.
+		_ = s.frameNode.reset()
 	}
 	return t, nil
 }

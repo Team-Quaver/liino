@@ -73,8 +73,8 @@ func readAll(t *testing.T, st decode.Stream, timeout time.Duration) readResult {
 	}
 }
 
-// TestOpenAutoOgg exercises the real fallback path: Media Foundation rejects
-// the file, and OpenAuto must land on this backend.
+// TestOpenAutoOgg exercises the real auto path: Ogg is not in Media
+// Foundation, and WinRT is the Windows default, so OpenAuto must land here.
 func TestOpenAutoOgg(t *testing.T) {
 	if ok, note := (backend{}).Probe(); !ok {
 		t.Skipf("WinRT audio unavailable: %s", note)

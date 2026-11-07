@@ -192,6 +192,82 @@ func waitState(t *testing.T, p *Player, ch <-chan Event, want State, timeout tim
 	}
 }
 
+// TestBufferingRecoversWhenFramesFlow covers the real-time decoder path: after
+// a seek the pipe never refills to half the preroll depth, but the device keeps
+// consuming frames. Recovery must follow pulled frames, not pipe occupancy, or
+// the UI stays on the buffering spinner while audio is already playing.
+func TestBufferingRecoversWhenFramesFlow(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	cfg := testConfig("fake")
+	cfg.MonitorInterval = time.Hour
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	p.mu.Lock()
+	p.cfg.PrerollFrames = 9600
+	p.state = StateBuffering
+	p.bufferAt = 0
+	p.mu.Unlock()
+	p.pulled.Store(uint64(p.cfg.PeriodFrames))
+	p.evaluate()
+
+	if snap := p.Snapshot(); snap.State != StatePlaying {
+		t.Fatalf("state = %s, want playing after %d frames reached the device", snap.State, p.cfg.PeriodFrames)
+	}
+}
+
+// A momentary empty pipe between two callbacks is not a stall. The device's
+// OnUnderrun callback is the authoritative signal; polling Available() at the
+// monitor tick used to flip a healthy real-time stream into buffering.
+func TestEmptyPipeDoesNotPausePlaying(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	cfg := testConfig("fake")
+	cfg.MonitorInterval = time.Hour
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	p.mu.Lock()
+	p.state = StatePlaying
+	p.mu.Unlock()
+	p.pipe.Load().Reset()
+	p.evaluate()
+
+	if snap := p.Snapshot(); snap.State != StatePlaying {
+		t.Fatalf("state = %s, want playing while the output callback is still running", snap.State)
+	}
+}
+
+// Recovery must still wait when nothing reaches the device: a real network
+// stall has pulled=0 past bufferAt, so the spinner should stay honest.
+func TestBufferingWaitsWithoutFrames(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	cfg := testConfig("fake")
+	cfg.MonitorInterval = time.Hour
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	p.mu.Lock()
+	p.cfg.PrerollFrames = 9600
+	p.state = StateBuffering
+	p.bufferAt = 0
+	p.mu.Unlock()
+	p.pulled.Store(0)
+	p.evaluate()
+
+	if snap := p.Snapshot(); snap.State != StateBuffering {
+		t.Fatalf("state = %s, want buffering while no frames reach the device", snap.State)
+	}
+}
+
 func TestPlayerPlaysToCompletion(t *testing.T) {
 	fake := &fakeBackend{}
 	registerFake(t, fake)

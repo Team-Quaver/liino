@@ -198,6 +198,12 @@ type Player struct {
 	muted     bool
 
 	pulled  atomic.Uint64 // frames handed to the device since the last seek
+	// bufferAt records pulled when the pipeline entered StateBuffering. A
+	// real-time decoder (WinRT AudioGraph) does not fill the pipe to half the
+	// preroll depth, so recovery must also accept frames actually reaching the
+	// device; otherwise seek leaves the UI in a permanent buffering state while
+	// audio keeps playing.
+	bufferAt uint64
 	decoded atomic.Uint64 // frames produced by the decoder since the last seek
 	gen     generations
 	quit    chan struct{}
@@ -468,6 +474,7 @@ func (p *Player) Seek(d time.Duration) error {
 	seekGen := p.gen.nextSeek()
 	p.clock.base = d
 	p.pulled.Store(0)
+	p.bufferAt = 0
 	p.eof = false
 	p.chain.Reset()
 	p.pipe.Load().Reset()
@@ -966,6 +973,7 @@ func (p *Player) reopenIf(loadGen, seekGen uint64, at time.Duration, resume bool
 	p.wantPlay = resume
 	p.base = at
 	p.pulled.Store(0)
+	p.bufferAt = 0
 	p.clock = newClock(pcm.DefaultSampleRate)
 	p.clock.base = at
 	p.state = StateLoading
