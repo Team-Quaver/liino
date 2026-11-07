@@ -36,6 +36,12 @@ type stream struct {
 	mu     sync.Mutex
 	closed bool
 	eof    bool
+	// started reports whether ReadSample has run at least once. Media
+	// Foundation's FLAC media source defers seeking until the reader has been
+	// pumped: SetCurrentPosition before the first ReadSample returns S_OK but
+	// leaves playback at 0. A resume/quality switch seeks immediately after
+	// Open, so seek() primes the reader first (see primeReader).
+	started bool
 }
 
 func newStream(reader *mediafoundation.IMFSourceReader, meta decode.Meta, rate, ch int) *stream {
@@ -89,6 +95,7 @@ func (s *stream) read() (pcm.Chunk, error) {
 		if err := s.reader.ReadSample(audioStreamIndex, 0, &actual, &flags, &ts, &sample); err != nil {
 			return pcm.Chunk{}, fmt.Errorf("wmf: read: %w", err)
 		}
+		s.started = true
 		if flags&uint32(mediafoundation.MF_SOURCE_READERF_ERROR) != 0 {
 			if sample != nil {
 				sample.Release()
@@ -201,6 +208,11 @@ func (s *stream) seek(t time.Duration) (time.Duration, error) {
 	if t < 0 {
 		t = 0
 	}
+	if !s.started {
+		if err := s.primeReader(); err != nil {
+			return 0, fmt.Errorf("wmf: seek prime: %w", err)
+		}
+	}
 	// GUID_NULL means "100-nanosecond units", which is what PROPVARIANT VT_I8
 	// carries below. Pass a pointer to the nil GUID, not a nil pointer:
 	// MFSourceReader dereferences pguidTimeFormat, so NULL crashes the process.
@@ -212,6 +224,31 @@ func (s *stream) seek(t time.Duration) (time.Duration, error) {
 	_ = s.reader.Flush(audioStreamIndex)
 	s.eof = false
 	return t, nil
+}
+
+// primeReader advances the Source Reader once before the first seek. FLAC's
+// media source lazily starts its demuxer on the first ReadSample; until then
+// SetCurrentPosition is accepted but has no effect. The primed sample belongs
+// to position 0 and is discarded, just like the old samples Flush drops after
+// the seek.
+func (s *stream) primeReader() error {
+	var (
+		actual uint32
+		flags  uint32
+		ts     int64
+		sample *mediafoundation.IMFSample
+	)
+	if err := s.reader.ReadSample(audioStreamIndex, 0, &actual, &flags, &ts, &sample); err != nil {
+		return err
+	}
+	s.started = true
+	if sample != nil {
+		sample.Release()
+	}
+	if flags&uint32(mediafoundation.MF_SOURCE_READERF_ERROR) != 0 {
+		return errors.New("source reader reported an error")
+	}
+	return nil
 }
 
 func (s *stream) Close() error {

@@ -15,6 +15,7 @@ package main
 /*
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 */
 import "C"
 
