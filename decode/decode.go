@@ -8,13 +8,21 @@
 // downmix themselves, because swresample cannot rematrix layouts it does not
 // know (7.1.4 Opus reports 12 channels with no layout).
 //
-// Four backends ship with Liino:
+// Six backends ship with Liino:
 //
 //   - wmf: Windows Media Foundation's Source Reader (Windows only). It reaches
 //     the OS codec pack in-process, so MP3/AAC/FLAC/ALAC/WMA and anything else
 //     the machine already supports decode without shipping FFmpeg.
+//   - winrt: Windows.Media.Core/AudioGraph (Windows only). It reaches the
+//     Store codec package ("Web Media Extensions"), whose AppX media source
+//     the legacy Source Reader cannot activate; this is the path for Ogg
+//     Vorbis/Opus on Windows.
 //   - avf: AVFoundation + CoreMedia (macOS only). AVAssetReader decodes through
 //     the same Core Audio codecs Finder/QuickTime use.
+//   - ogg: pure Go Ogg Vorbis/Opus (macOS only). AVFoundation has no Ogg
+//     demuxer, so this runs between it and ffgo and needs neither FFmpeg nor
+//     Node: jfreymuth/oggvorbis handles Vorbis, thesyncim/gopus handles Opus
+//     including multistream layouts such as 7.1.4.
 //   - native: ffgo, pure Go bindings that dlopen the system FFmpeg
 //     (libavformat/libavcodec/libavutil/libswresample) through purego. No CGO,
 //     no bundled FFmpeg binaries. It is the primary backend on Linux and the

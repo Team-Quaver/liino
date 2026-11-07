@@ -35,7 +35,9 @@ import (
 	// Backends register themselves; the stubs are no-ops on other platforms.
 	_ "github.com/team-quaver/liino/decode/avf"
 	_ "github.com/team-quaver/liino/decode/native"
+	_ "github.com/team-quaver/liino/decode/ogg"
 	_ "github.com/team-quaver/liino/decode/wasm"
+	_ "github.com/team-quaver/liino/decode/winrt"
 	_ "github.com/team-quaver/liino/decode/wmf"
 	_ "github.com/team-quaver/liino/output/pipewire"
 	_ "github.com/team-quaver/liino/output/system"
