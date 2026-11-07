@@ -52,13 +52,23 @@ type nullOutput struct {
 	wg      sync.WaitGroup
 }
 
+// Start begins the pull loop.
 func (n *nullOutput) Start() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	return n.startLocked()
+}
+
+// startLocked arms the timer sink. Resume goes through it as well: WASAPI and
+// Core Audio restart themselves from Resume when the stream was stopped, so a
+// sink that only flipped its state here would report running while consuming
+// nothing — exactly the silent freeze the engine tests are meant to catch.
+func (n *nullOutput) startLocked() error {
 	if n.state == StateClosed {
 		return ErrClosed
 	}
 	if n.running {
+		n.state = StateRunning
 		return nil
 	}
 	n.running = true
@@ -101,11 +111,7 @@ func (n *nullOutput) Pause() error {
 func (n *nullOutput) Resume() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.state == StateClosed {
-		return ErrClosed
-	}
-	n.state = StateRunning
-	return nil
+	return n.startLocked()
 }
 
 func (n *nullOutput) Stop() error {

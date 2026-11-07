@@ -185,7 +185,15 @@ type Player struct {
 	base        time.Duration
 	eof         bool
 	wantPlay    bool
-	primed      bool
+	// playIntent is what the user asked for: Play sets it, Pause/Stop/Open clear
+	// or set it. wantPlay is narrower — "the device may run right now" — and the
+	// engine clears it whenever the machine parks itself (end of file, failure,
+	// a paused session being torn down). Rebuilds must follow the intent, not the
+	// parked flag: clearing both at end of file is what made a seek after the
+	// last frame reopen a pipeline that nobody was allowed to start, leaving the
+	// app silent with the progress bar frozen.
+	playIntent bool
+	primed     bool
 	// seekRebuilds is the remaining decoder-rebuild budget for failed seeks in
 	// the current load (see rebuildAfterSeek / takeSeekRebuild).
 	seekRebuilds int
@@ -197,21 +205,25 @@ type Player struct {
 	volume    float64
 	muted     bool
 
-	pulled  atomic.Uint64 // frames handed to the device since the last seek
+	pulled atomic.Uint64 // frames handed to the device since the last seek
 	// bufferAt records pulled when the pipeline entered StateBuffering. A
 	// real-time decoder (WinRT AudioGraph) does not fill the pipe to half the
 	// preroll depth, so recovery must also accept frames actually reaching the
 	// device; otherwise seek leaves the UI in a permanent buffering state while
 	// audio keeps playing.
 	bufferAt uint64
-	decoded atomic.Uint64 // frames produced by the decoder since the last seek
-	gen     generations
-	quit    chan struct{}
-	wake    chan struct{}
-	seekReq chan seekRequest
-	closed  bool
-	decWG   sync.WaitGroup
-	monWG   sync.WaitGroup
+	// starting is the single-flight flag for the asynchronous device start
+	// (see requestDeviceStart). Without it the monitor would queue one blocked
+	// session open after another behind a sound service that never answers.
+	starting atomic.Bool
+	decoded  atomic.Uint64 // frames produced by the decoder since the last seek
+	gen      generations
+	quit     chan struct{}
+	wake     chan struct{}
+	seekReq  chan seekRequest
+	closed   bool
+	decWG    sync.WaitGroup
+	monWG    sync.WaitGroup
 }
 
 // New creates a player. It does not touch an audio device until Play is called,
@@ -282,11 +294,13 @@ func (p *Player) Open(ctx context.Context, src decode.Source, opts OpenOptions) 
 	p.eof = false
 	p.primed = false
 	p.wantPlay = opts.AutoPlay
+	p.playIntent = opts.AutoPlay
 	p.seekRebuilds = seekRebuildBudget
 	p.loopAlive = true
 	p.dropQueuedSeek() // a target queued for the previous track must not move this one
 	p.pending = nil
 	p.pulled.Store(0)
+	p.bufferAt = 0
 	p.decoded.Store(0)
 	p.base = maxDuration(opts.StartAt, 0)
 	p.clock = newClock(pcm.DefaultSampleRate)
@@ -338,6 +352,7 @@ func (p *Player) Play() error {
 		p.mu.Lock()
 	}
 	p.wantPlay = true
+	p.playIntent = true
 	switch p.state {
 	case StateEnded:
 		// Replay after end of file: reopen from the top.
@@ -347,7 +362,18 @@ func (p *Player) Play() error {
 		out := p.out
 		p.mu.Unlock()
 		if out == nil {
-			return p.Play()
+			// A device switch that failed leaves the session gone while the state
+			// still says paused. Opening an endpoint can block on the OS mixer and
+			// Play() is called straight from the host's FFI thread, so hand the
+			// start back to the monitor — wantPlay is already set — instead of
+			// opening it here or recursing into Play() until the stack dies.
+			p.mu.Lock()
+			if !p.closed && p.state == StatePaused {
+				p.state = StateReady
+			}
+			p.mu.Unlock()
+			p.nudge()
+			return nil
 		}
 		if err := out.Resume(); err != nil {
 			p.fail(err)
@@ -371,14 +397,16 @@ func (p *Player) Pause() error {
 	}
 	out := p.out
 	state := p.state
+	// Pause is a user decision, so it owns both flags. Without clearing
+	// playIntent a later rebuild (unseekable source, failed seek) would answer
+	// "resume?" with yes and start making sound on a track the user paused.
+	p.playIntent = false
+	p.wantPlay = false
 	p.mu.Unlock()
 	if state == StatePaused {
 		return nil
 	}
 	if out == nil {
-		p.mu.Lock()
-		p.wantPlay = false
-		p.mu.Unlock()
 		return nil
 	}
 	if err := out.Pause(); err != nil {
@@ -399,6 +427,7 @@ func (p *Player) Stop() error {
 	}
 	p.wantPlay = false
 	fade := p.cfg.FadeOut
+	p.playIntent = false
 	playing := p.state == StatePlaying || p.state == StateBuffering || p.state == StateReady
 	pending := p.pending
 	p.pending = nil
@@ -431,6 +460,7 @@ func (p *Player) hardStop() {
 	gen := p.gen.nextLoad()
 	p.pending = nil
 	p.wantPlay = false
+	p.playIntent = false
 	p.eof = false
 	p.primed = false
 	p.dropQueuedSeek()
@@ -438,6 +468,7 @@ func (p *Player) hardStop() {
 	p.state = StateStopped
 	p.clock.base = 0
 	p.pulled.Store(0)
+	p.bufferAt = 0
 	p.pipe.Load().Interrupt()
 	p.pipe.Load().Reset()
 	p.chain.Reset()
@@ -601,12 +632,14 @@ func (p *Player) dropQueuedSeek() {
 const seekRebuildBudget = 1
 
 // resumeIntent reports whether a rebuilt pipeline should start producing
-// sound. Play/Pause own wantPlay, so a seek issued while paused stays paused
-// and a seek issued while buffering still resumes.
+// sound. It follows the user's intent, not the machine's current permission to
+// run the device: a rebuild after end of file must resume (the engine parked
+// itself, the listener did not ask for that), while a rebuild after Pause must
+// stay silent.
 func (p *Player) resumeIntent() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.wantPlay
+	return p.playIntent
 }
 
 // takeSeekRebuild consumes one rebuild attempt from the current load's budget.
@@ -632,12 +665,12 @@ func (p *Player) takeSeekRebuild() bool {
 func (p *Player) rebuildAfterSeek(gen uint64, at time.Duration, cause error) error {
 	p.mu.Lock()
 	stale := p.closed || gen != p.gen.curLoad()
-	resume := p.wantPlay
 	p.mu.Unlock()
 	if stale {
 		p.logf("seek rebuild skipped: generation moved on")
 		return nil
 	}
+	resume := p.resumeIntent()
 	if !p.takeSeekRebuild() {
 		return fmt.Errorf("seek: %w", cause)
 	}
@@ -660,8 +693,8 @@ func (p *Player) rebuildAfterRead(gen uint64, cause error) bool {
 		return false
 	}
 	pos := p.clock.position(p.pulled.Load())
-	resume := p.wantPlay
 	p.mu.Unlock()
+	resume := p.resumeIntent()
 	if !p.takeSeekRebuild() {
 		return false
 	}

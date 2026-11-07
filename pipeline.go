@@ -218,8 +218,11 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 				// This goroutine is the only reader, and it is about to exit;
 				// hand the target back and restart there instead of silently
 				// dropping it (the "seek near the end freezes playback" bug).
+				// Guarded by this generation: if a track switch landed while the
+				// tail drained, the new load owns the pipeline and an unguarded
+				// reopen here would tear its stream down underneath it.
 				if req, ok := p.retireLoop(gen); ok {
-					if rerr := p.reopen(req.at, p.resumeIntent()); rerr != nil {
+					if rerr := p.reopenIf(gen, 0, req.at, p.resumeIntent()); rerr != nil {
 						p.failGen(gen, rerr)
 					}
 				}
@@ -310,7 +313,7 @@ func (p *Player) applyPendingSeek(gen uint64, stream decode.Stream) bool {
 	p.pulled.Store(0)
 	if !seekable {
 		p.logf("source is not seekable, reloading at %s", req.at)
-		if err := p.reopen(req.at, p.resumeIntent()); err != nil {
+		if err := p.reopenIf(gen, 0, req.at, p.resumeIntent()); err != nil {
 			p.failGen(gen, err)
 		}
 		return true
@@ -540,8 +543,13 @@ func outputChannelPlan(driverName, deviceID string, sourceCh int) int {
 	return pcm.DefaultChannels
 }
 
-// startDevice primes the output and reports the transition.
-func (p *Player) startDevice() {
+// startDevice primes the output and reports the transition. It returns an
+// error when no session could be handed to the device, so the caller can leave
+// the state machine somewhere it will try again: "playing" with a stopped
+// endpoint is the one combination that never recovers on its own, because the
+// monitor only starts devices from Loading/Ready and nothing pulls frames to
+// trigger an underrun.
+func (p *Player) startDevice() error {
 	p.mu.Lock()
 	out := p.out
 	deviceID := p.cfg.DeviceID
@@ -549,22 +557,55 @@ func (p *Player) startDevice() {
 	if out == nil {
 		if err := p.ensureOutput(deviceID); err != nil {
 			p.fail(err)
-			return
+			return err
 		}
 		p.mu.Lock()
 		out = p.out
 		p.mu.Unlock()
 	}
 	// Close or a device rebuild can drop the session between ensureOutput
-	// returning and this read; starting nothing is the correct, silent outcome.
+	// returning and this read: nothing was started, say so.
 	if out == nil {
-		return
+		return ErrNotRunning
 	}
 	if err := out.Start(); err != nil {
 		p.fail(fmt.Errorf("output start: %w", err))
-		return
+		return err
 	}
 	p.publish(Event{Kind: KindPlaying, Name: "playing"})
+	return nil
+}
+
+// requestDeviceStart primes the output on its own goroutine. The monitor must
+// not wait for it: PipeWire stream creation goes through the session manager
+// and WASAPI activation through the audio service, and either can take seconds
+// or never answer at all. A monitor parked in there is not a slow start, it is
+// the whole state machine gone — preroll never turns into playing, EOF never
+// turns into ended, and every later track change stays silent.
+//
+// Single-flight by design: the attempt stays claimed while it runs, so a dead
+// endpoint cannot stack one blocked open after another behind the other.
+func (p *Player) requestDeviceStart() {
+	if !p.starting.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer p.starting.Store(false)
+		err := p.startDevice()
+		if err == nil {
+			return
+		}
+		// The endpoint never came up (closed under us, or a rebuild owns it).
+		// Hand the state back to Ready so the next tick tries again; leaving it
+		// Playing freezes the timeline in silence with nothing to recover it.
+		p.logf("device start failed: %v", err)
+		p.mu.Lock()
+		if !p.closed && p.state == StatePlaying {
+			p.state = StateReady
+		}
+		p.mu.Unlock()
+		p.nudge()
+	}()
 }
 
 // onUnderrun converts a device-side gap into a buffering transition.
@@ -629,7 +670,7 @@ func (p *Player) evaluate() {
 		if p.wantPlay && (avail >= p.cfg.PrerollFrames || p.eof || p.framesPulledSince(period)) {
 			p.state = StatePlaying
 			p.mu.Unlock()
-			p.startDevice()
+			p.requestDeviceStart()
 			return
 		}
 	case StateBuffering:
@@ -737,6 +778,7 @@ func (p *Player) checkDevice() {
 	}
 	pos := p.clock.position(p.pulled.Load())
 	p.pulled.Store(0)
+	p.bufferAt = 0
 	p.clock = newClock(pcm.DefaultSampleRate)
 	p.clock.base = pos
 	p.wantPlay = state == StatePlaying || state == StateBuffering

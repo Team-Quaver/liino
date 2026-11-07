@@ -1065,3 +1065,201 @@ func (s *flakySession) Underruns() uint64     { _, u := s.pump.Counters(); retur
 func (s *flakySession) Latency() time.Duration {
 	return time.Duration(s.period) * time.Second / time.Duration(s.format.SampleRate)
 }
+
+// Rebuilds triggered while the engine has already parked must follow the user's
+// intent, not the machine's own stop signal.
+
+// End of file parks the machine: the device is stopped and the decode goroutine
+// has retired, so a seek issued at that moment has to rebuild the pipeline. The
+// rebuild must follow what the listener asked for, not the parked flag — the
+// engine clearing both made the reopened source load into "ready" with a
+// stopped device: silent, progress bar frozen, and dragging again only parked
+// it once more ("song ends, a few drags and it's stuck").
+func TestSeekAfterEndResumesWithoutPlay(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(128)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StateEnded, 6*time.Second)
+
+	for _, at := range []time.Duration{500 * time.Millisecond, 1200 * time.Millisecond, 200 * time.Millisecond} {
+		if err := p.Seek(at); err != nil {
+			t.Fatalf("seek to %s: %v", at, err)
+		}
+		waitState(t, p, events, StatePlaying, 3*time.Second)
+		before := p.pulled.Load()
+		time.Sleep(200 * time.Millisecond)
+		if p.pulled.Load() <= before {
+			t.Fatalf("seek to %s left the device idle: state=%s pulled=%d buffered=%s",
+				at, p.Snapshot().State, before, p.Snapshot().Buffered)
+		}
+	}
+	if snap := p.Snapshot(); snap.Position < 100*time.Millisecond {
+		t.Fatalf("position after the last seek = %s, want the timeline moving", snap.Position)
+	}
+}
+
+// A paused track must stay silent when a seek has to rebuild the decoder. The
+// rebuild used to ask wantPlay, which Pause() leaves set because the device
+// session keeps running and emits silence — so scrubbing an unseekable stream
+// while paused started making sound again.
+func TestSeekWhilePausedRebuildsSilently(t *testing.T) {
+	registerFake(t, &fakeBackend{unseekable: true})
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(128)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+	if err := p.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Seek(1 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	snap := p.Snapshot()
+	if snap.State == StatePlaying || snap.State == StateBuffering {
+		t.Fatalf("state = %s after a seek issued while paused, want a silent rebuild", snap.State)
+	}
+	if pulled := p.pulled.Load(); pulled != 0 {
+		t.Fatalf("paused rebuild handed the device %d frames", pulled)
+	}
+}
+
+// A device switch that fails to open drops the output session while the state
+// still says paused. Play() answered that combination by recursing into itself
+// until the process died on a stack overflow; it now hands the start back to
+// the monitor, which opens the endpoint off the FFI thread.
+func TestPlayAfterOutputSessionVanishes(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(128)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+	if err := p.Pause(); err != nil {
+		t.Fatal(err)
+	}
+
+	p.mu.Lock()
+	out := p.out
+	p.out = nil
+	p.mu.Unlock()
+	if out != nil {
+		_ = out.Close()
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- p.Play() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("play: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Play() did not return after the output session disappeared")
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+	before := p.pulled.Load()
+	time.Sleep(200 * time.Millisecond)
+	if p.pulled.Load() <= before {
+		t.Fatalf("play reported playing but the new session consumed nothing")
+	}
+}
+
+// A reopen started by a generation that no longer owns the pipeline must leave
+// the newer load alone: it was reopening the previous track's breakpoint over
+// the song the user had just skipped to.
+func TestStaleReopenYieldsToNewerLoad(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://first"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	stale := p.gen.curLoad()
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://second"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	current := p.gen.curLoad()
+
+	if err := p.reopenIf(stale, 0, time.Second, true); err != nil {
+		t.Fatalf("stale reopen: %v", err)
+	}
+	if got := p.gen.curLoad(); got != current {
+		t.Fatalf("stale reopen bumped the generation %d -> %d", current, got)
+	}
+	p.mu.Lock()
+	uri := p.src.URI
+	p.mu.Unlock()
+	if uri != "fake://second" {
+		t.Fatalf("source after stale reopen = %q, want the newer load untouched", uri)
+	}
+}
+
+// Whatever resets the device clock must reset the buffering high-water mark as
+// well. A stale value from the previous track puts framesPulledSince out of
+// reach, and a decoder that produces at playback rate never fills the pipe to
+// half the preroll either — the UI would sit on the spinner until the number
+// caught up, tens of seconds later.
+func TestLoadAndStopResetBufferHighWater(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	highWater := func() uint64 {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.bufferAt
+	}
+
+	p.mu.Lock()
+	p.bufferAt = 10_000_000
+	p.mu.Unlock()
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := highWater(); got != 0 {
+		t.Fatalf("bufferAt after Open = %d, want the previous track's mark dropped", got)
+	}
+
+	p.mu.Lock()
+	p.bufferAt = 5_000_000
+	p.mu.Unlock()
+	if err := p.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if got := highWater(); got != 0 {
+		t.Fatalf("bufferAt after Stop = %d, want it reset with the clock", got)
+	}
+}
