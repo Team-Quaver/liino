@@ -22,7 +22,11 @@
    - `dl_windows.go` (new) loads DLLs with `LoadLibraryExW` plus
      `LOAD_WITH_ALTERED_SEARCH_PATH`, so an app-local FFmpeg build resolves its
      sibling DLLs without touching `PATH`.
-2. `internal/bindings/bindings.go`: `tryOpen` now calls `dl.Open`.
+2. `internal/bindings/bindings.go`: `tryOpen` now calls `dl.Open`; `loadLibrary`
+   probes the SONAMEs installed on disk first (newest per search path) and only
+   then falls back to the fixed version list. Otherwise a stale ABI left next to
+   the current one (`ffmpeg4.4`'s `libavutil.so.56` beside FFmpeg 9's `.61`)
+   wins merely because its number is still in the hard-coded list.
 3. `internal/shim/shim.go`: the optional C shim loads through `dl.Open`.
 4. Module path rewritten from `github.com/nonibytes/ffgo` to
    `github.com/team-quaver/ffgo` across all sources.

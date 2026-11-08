@@ -107,8 +107,19 @@ func doLoad() error {
 	return nil
 }
 
-// loadLibrary attempts to load a library by trying versioned names.
+// loadLibrary attempts to load a library by trying the SONAMEs installed on
+// disk first, then falling back to a fixed version list.
 func loadLibrary(name string, versions []int) (uintptr, error) {
+	// Prefer what is actually installed. The hard-coded list below goes stale
+	// every time FFmpeg bumps a library, and a stale ABI living in the same
+	// directory (for example ffmpeg4.4's libavutil.so.56 next to FFmpeg 9's
+	// .61) would otherwise win just because its version is still in the list.
+	for _, candidate := range discover(name) {
+		if lib, err := tryOpen(candidate); err == nil {
+			return lib, nil
+		}
+	}
+
 	// Try each search path
 	for _, searchPath := range LibrarySearchPaths() {
 		// Try versioned names first (more specific)
@@ -148,30 +159,23 @@ func loadLibrary(name string, versions []int) (uintptr, error) {
 		return lib, nil
 	}
 
-	// Last resort: discover the SONAME on disk. Hard-coded version lists go
-	// stale every time FFmpeg bumps a library (v0.1.1 stopped at avformat 61,
-	// so FFmpeg 8 could not be loaded at all), while the file name pattern is
-	// stable. Newest version wins.
-	for _, candidate := range discover(name) {
-		if lib, err := tryOpen(candidate); err == nil {
-			return lib, nil
-		}
-	}
-
 	return 0, fmt.Errorf("%w: %s", ErrLibraryNotFound, name)
 }
 
 // discover scans the search paths for soname-style library files matching a
-// base name, newest version first.
+// base name. Search-path order is preserved (so LD_LIBRARY_PATH / PATH and an
+// app-local directory still win); within one directory, newer versions sort
+// first.
 func discover(name string) []string {
 	patterns := platform.DiscoverPatterns(name)
 	type found struct {
 		path string
 		ver  [3]int
 	}
-	var hits []found
 	seen := map[string]bool{}
+	var out []string
 	for _, dir := range LibrarySearchPaths() {
+		var hits []found
 		for _, pattern := range patterns {
 			matches, err := filepath.Glob(filepath.Join(dir, pattern))
 			if err != nil {
@@ -185,19 +189,18 @@ func discover(name string) []string {
 				hits = append(hits, found{path: m, ver: versionKey(filepath.Base(m))})
 			}
 		}
-	}
-	sort.SliceStable(hits, func(i, j int) bool {
-		a, b := hits[i].ver, hits[j].ver
-		for k := range a {
-			if a[k] != b[k] {
-				return a[k] > b[k]
+		sort.SliceStable(hits, func(i, j int) bool {
+			a, b := hits[i].ver, hits[j].ver
+			for k := range a {
+				if a[k] != b[k] {
+					return a[k] > b[k]
+				}
 			}
+			return hits[i].path < hits[j].path
+		})
+		for _, h := range hits {
+			out = append(out, h.path)
 		}
-		return hits[i].path < hits[j].path
-	})
-	out := make([]string, 0, len(hits))
-	for _, h := range hits {
-		out = append(out, h.path)
 	}
 	return out
 }
