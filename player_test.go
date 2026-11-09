@@ -697,6 +697,43 @@ func TestStopIfCurrentGenerationStops(t *testing.T) {
 	}
 }
 
+// StopIf checks the track generation before starting its fade, but Open can
+// still land while the fade or a blocking close is running. hardStopIf must
+// re-check at the point it would reset the pipe, otherwise the old stop tears
+// down the stream that just replaced it.
+func TestHardStopIfRechecksAfterOpen(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(256)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://first"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+	oldGen := p.TrackGeneration()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://second"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+
+	p.hardStopIf(oldGen)
+	time.Sleep(100 * time.Millisecond)
+
+	if got := p.TrackGeneration(); got <= oldGen {
+		t.Fatalf("generation = %d, want a newer load than %d", got, oldGen)
+	}
+	if got := p.Snapshot().State; got == StateStopped || got == StateClosed {
+		t.Fatalf("old hardStopIf stopped the new stream: state = %s", got)
+	}
+}
+
 // lateBackend blocks in Open until released, then yields one chunk per read.
 type lateBackend struct {
 	gate chan struct{}

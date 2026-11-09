@@ -459,24 +459,39 @@ func (p *Player) StopIf(gen uint64) error {
 		pending()
 	}
 	if !playing {
-		p.hardStop()
+		p.hardStopIf(gen)
 		return nil
 	}
 	if fade <= 0 {
-		p.hardStop()
+		p.hardStopIf(gen)
 		return nil
 	}
 	p.mu.Lock()
 	p.chain.StartFade(dsp.FadeOut, float64(fade/time.Millisecond), dsp.CurveEqualPower)
-	p.pending = func() { p.hardStop() }
+	// Keep the track generation in the deferred action: Open can land between
+	// the check above and the fade completing. If it did, this stop belongs to
+	// the previous track and must not reset the new stream's pipe/device.
+	p.pending = func() { p.hardStopIf(gen) }
 	p.mu.Unlock()
 	p.nudge()
 	return nil
 }
 
 func (p *Player) hardStop() {
+	p.hardStopIf(0)
+}
+
+// hardStopIf is hardStop guarded by the track generation that requested it.
+// StopIf checks the generation before starting the fade, but Open can still
+// land while the fade or a blocking stream close is in progress. Re-checking
+// here is what keeps an old stop from resetting the next track's pipe.
+func (p *Player) hardStopIf(trackGen uint64) {
 	p.mu.Lock()
 	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	if trackGen != 0 && trackGen != p.gen.curTrack() {
 		p.mu.Unlock()
 		return
 	}
@@ -530,7 +545,7 @@ func (p *Player) resumeAfterSupersededStop(gen uint64) {
 		p.mu.Unlock()
 		return
 	}
-	restart := p.wantPlay && (p.state == StateLoading || p.state == StateReady || p.state == StatePlaying)
+	restart := p.wantPlay && (p.state == StateLoading || p.state == StateReady || p.state == StateBuffering || p.state == StatePlaying)
 	if restart && p.state == StatePlaying {
 		p.state = StateReady
 	}
