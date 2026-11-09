@@ -69,11 +69,14 @@ func (s State) Live() bool {
 // generations are the only way late callbacks get rejected. Each counter is
 // monotonic and never resets, so a stale event can always be recognised.
 type generations struct {
+	track atomic.Uint64 // bumped by Open: which track owns the player (stop guard)
 	load  atomic.Uint64 // bumped by Open/Stop: which media owns the pipeline
 	seek  atomic.Uint64 // bumped by Seek: which position the pipeline plays
 	epoch atomic.Uint64 // bumped when the output session is rebuilt
 }
 
+func (g *generations) nextTrack() uint64 { return g.track.Add(1) }
+func (g *generations) curTrack() uint64  { return g.track.Load() }
 func (g *generations) nextLoad() uint64  { return g.load.Add(1) }
 func (g *generations) nextSeek() uint64  { return g.seek.Add(1) }
 func (g *generations) nextEpoch() uint64 { return g.epoch.Add(1) }

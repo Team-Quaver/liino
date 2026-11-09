@@ -617,6 +617,86 @@ func TestStaleGenerationCannotPlayOldTrack(t *testing.T) {
 	}
 }
 
+// A detached Stop issued for the previous track can run after the next Open.
+// It must not tear that new stream down: otherwise no loaded event is ever
+// published and the host sits on its loading spinner until a watchdog fires.
+func TestStopIfIgnoresSupersededLoad(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(256)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://first"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+	oldGen := p.TrackGeneration()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://second"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	// This is the delayed goroutine from the old track's Stop command.
+	if err := p.StopIf(oldGen); err != nil {
+		t.Fatal(err)
+	}
+
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+	if got := p.TrackGeneration(); got <= oldGen {
+		t.Fatalf("generation = %d, want a newer load than %d", got, oldGen)
+	}
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == KindClosed {
+				t.Fatalf("superseded Stop closed the new stream (gen=%d)", ev.Gen)
+			}
+		case <-time.After(50 * time.Millisecond):
+			return
+		}
+	}
+}
+
+// StopIf(0) / Stop still stops the generation that is actually current.
+func TestStopIfCurrentGenerationStops(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(256)
+	defer cancel()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://tone"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, p, events, StatePlaying, 3*time.Second)
+
+	if err := p.StopIf(p.TrackGeneration()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == KindClosed {
+				if p.Snapshot().State != StateStopped {
+					t.Fatalf("state = %s, want stopped", p.Snapshot().State)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("stop did not publish a closed event")
+		}
+	}
+}
+
 // lateBackend blocks in Open until released, then yields one chunk per read.
 type lateBackend struct {
 	gate chan struct{}

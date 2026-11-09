@@ -285,6 +285,7 @@ func (p *Player) Open(ctx context.Context, src decode.Source, opts OpenOptions) 
 		p.mu.Unlock()
 		return ErrClosed
 	}
+	p.gen.nextTrack()
 	gen := p.gen.nextLoad()
 	p.gen.nextSeek()
 	p.src = src
@@ -417,13 +418,35 @@ func (p *Player) Pause() error {
 	return nil
 }
 
+// TrackGeneration reports which Open owns the player. It only advances on a
+// real track change, not on an internal decoder rebuild (a failed seek or read
+// recovery keeps the same track). Detached FFI commands capture it before
+// returning to the host, so a command issued for an old track can recognise a
+// newer Open that landed while it was queued.
+func (p *Player) TrackGeneration() uint64 {
+	return p.gen.curTrack()
+}
+
 // Stop ends playback. With a configured fade it first ramps the tail out so the
 // device never hears a hard cut.
 func (p *Player) Stop() error {
+	return p.StopIf(0)
+}
+
+// StopIf is Stop guarded by the track generation the caller observed. Pass 0 to
+// stop whatever is current. The C API detaches stop (it may wait on a network
+// read or a device session), which means a stop issued for the previous track
+// can otherwise execute long after the next Open and tear down the new stream:
+// the renderer then waits forever for a loaded event that can no longer come.
+func (p *Player) StopIf(gen uint64) error {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		return ErrClosed
+	}
+	if gen != 0 && gen != p.gen.curTrack() {
+		p.mu.Unlock()
+		return nil
 	}
 	p.wantPlay = false
 	fade := p.cfg.FadeOut
@@ -480,11 +503,41 @@ func (p *Player) hardStop() {
 	if stream != nil {
 		_ = stream.Close()
 	}
-	if out != nil {
+	// Closing the stream can wait on a network read (up to rw_timeout). If a
+	// newer Open landed meanwhile it owns the same output object, so stopping
+	// it here would silence the new track; leave the session to the new lease.
+	p.mu.Lock()
+	stale := p.closed || p.gen.curLoad() != gen
+	p.mu.Unlock()
+	stoppedOutput := false
+	if !stale && out != nil {
 		_ = out.Stop()
+		stoppedOutput = true
 	}
-	_ = gen
-	p.publish(Event{Kind: KindClosed, Name: "stopped"})
+	if !p.publishFrom(gen, Event{Kind: KindClosed, Name: "stopped"}) && stoppedOutput {
+		p.resumeAfterSupersededStop(gen)
+	}
+}
+
+// resumeAfterSupersededStop repairs the one race generation checks cannot:
+// Stop captured the output before a newer Open landed, so out.Stop() may have
+// muted the share now owned by that load. Put a still-Playing state back to
+// Ready so the monitor starts the device again (a stalled session must not look
+// like playback to the UI).
+func (p *Player) resumeAfterSupersededStop(gen uint64) {
+	p.mu.Lock()
+	if p.closed || p.gen.curLoad() == gen {
+		p.mu.Unlock()
+		return
+	}
+	restart := p.wantPlay && (p.state == StateLoading || p.state == StateReady || p.state == StatePlaying)
+	if restart && p.state == StatePlaying {
+		p.state = StateReady
+	}
+	p.mu.Unlock()
+	if restart {
+		p.nudge()
+	}
 }
 
 // Seek jumps to a position. The device keeps running: the buffer is dropped,
@@ -1029,7 +1082,7 @@ func (p *Player) reopenIf(loadGen, seekGen uint64, at time.Duration, resume bool
 	}
 	p.decWG.Add(1)
 	go p.decodeLoop(context.Background(), gen, src, at)
-	p.publish(Event{Kind: KindSeeked})
+	p.publishFrom(gen, Event{Kind: KindSeeked})
 	return nil
 }
 
@@ -1059,12 +1112,13 @@ func (p *Player) fail(err error) {
 		p.mu.Unlock()
 		return
 	}
+	gen := p.gen.curLoad()
 	p.err = err
 	p.state = StateFailed
 	p.wantPlay = false
 	snap := p.snapshotLocked()
 	p.mu.Unlock()
-	p.publish(Event{Kind: KindFailed, Name: "failed", Err: err.Error(), Snapshot: snap})
+	p.publishFrom(gen, Event{Kind: KindFailed, Name: "failed", Err: err.Error(), Snapshot: snap})
 	if p.cfg.OnError != nil {
 		p.cfg.OnError(err)
 	}
@@ -1082,15 +1136,36 @@ func (p *Player) setState(st State, kind Kind) {
 
 func (p *Player) publish(ev Event) {
 	p.mu.Lock()
-	ev.Gen = p.gen.curLoad()
-	ev.SeekGen = p.gen.curSeek()
-	if ev.Snapshot.State == StateIdle && ev.Gen == 0 {
-		ev.Snapshot = p.snapshotLocked()
-	} else if ev.Snapshot.State == StateIdle {
-		ev.Snapshot = p.snapshotLocked()
-	}
+	p.stampLocked(p.gen.curLoad(), &ev)
 	p.mu.Unlock()
 	p.hub.publish(ev)
+}
+
+// publishFrom publishes an event only while gen still owns the pipeline. Events
+// produced by an asynchronous path (loaded/ended/closed) are stamped with the
+// generation that produced them, not whatever is current when a blocked close
+// finally returns: otherwise an old track's ended/closed arrives looking like
+// it belongs to the track the user just switched to.
+func (p *Player) publishFrom(gen uint64, ev Event) bool {
+	p.mu.Lock()
+	if p.closed || gen != p.gen.curLoad() {
+		p.mu.Unlock()
+		return false
+	}
+	p.stampLocked(gen, &ev)
+	p.mu.Unlock()
+	p.hub.publish(ev)
+	return true
+}
+
+// stampLocked fills the wire fields common to every event. The caller must
+// hold p.mu.
+func (p *Player) stampLocked(gen uint64, ev *Event) {
+	ev.Gen = gen
+	ev.SeekGen = p.gen.curSeek()
+	if ev.Snapshot.State == StateIdle {
+		ev.Snapshot = p.snapshotLocked()
+	}
 }
 
 // nudge asks the monitor to re-evaluate immediately.

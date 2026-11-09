@@ -192,12 +192,24 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 	}
 
 	p.mu.Lock()
+	if p.closed || p.gen.curLoad() != gen {
+		p.mu.Unlock()
+		_ = stream.Close()
+		return
+	}
 	if p.state == StateLoading {
 		p.state = StateReady
 	}
 	snap := p.snapshotLocked()
 	p.mu.Unlock()
-	p.publish(Event{Kind: KindLoaded, Name: "loaded", Snapshot: snap})
+	// publishFrom re-checks the generation: a new Open may have landed between
+	// the check above and the broadcast. An old loaded must never wake the new
+	// track's UI (the renderer would clear its spinner for a stream that is not
+	// actually installed).
+	if !p.publishFrom(gen, Event{Kind: KindLoaded, Name: "loaded", Snapshot: snap}) {
+		_ = stream.Close()
+		return
+	}
 	p.logf("loaded %s via %s (%s, %d Hz %d ch, %s)", src.Label(), backend.Name(),
 		p.meta.Codec, p.meta.SampleRate, p.meta.Channels, p.meta.Duration)
 
@@ -710,14 +722,25 @@ func (p *Player) framesPulledSince(period int) bool {
 // finishLocked transitions to Ended; the caller must hold p.mu.
 func (p *Player) finishLocked() {
 	out := p.out
+	gen := p.gen.curLoad()
 	p.state = StateEnded
 	p.wantPlay = false
 	snap := p.snapshotLocked()
 	p.mu.Unlock()
-	if out != nil {
+	// The output is shared by every load. A close can block while the user has
+	// already started the next track; stopping the session then would freeze
+	// the new stream, so only the generation that still owns it may do so.
+	p.mu.Lock()
+	stale := p.closed || p.gen.curLoad() != gen
+	p.mu.Unlock()
+	stoppedOutput := false
+	if !stale && out != nil {
 		_ = out.Stop()
+		stoppedOutput = true
 	}
-	p.publish(Event{Kind: KindEnded, Name: "ended", Snapshot: snap})
+	if !p.publishFrom(gen, Event{Kind: KindEnded, Name: "ended", Snapshot: snap}) && stoppedOutput {
+		p.resumeAfterSupersededStop(gen)
+	}
 	p.logf("playback ended")
 }
 

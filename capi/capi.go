@@ -250,7 +250,13 @@ func liino_stop(key *C.struct_liino_player, errp **C.char) C.int {
 	// Stop() may have to close the decoder stream (paused/idle sources) and that
 	// can wait on the network. Detach so the host's UI thread never parks here;
 	// state transitions still arrive through the event stream.
-	go func() { _ = h.player.Stop() }()
+	// Capture the generation now: by the time the goroutine runs the host may
+	// already have opened the next track. StopIf then becomes a no-op instead
+	// of tearing that new stream down (the "switch leaves it spinning forever"
+	// bug). A user-facing Stop is still honoured for the track that was
+	// actually current when the command was issued.
+	gen := h.player.TrackGeneration()
+	go func() { _ = h.player.StopIf(gen) }()
 	return codeOK
 }
 
