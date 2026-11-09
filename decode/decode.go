@@ -178,6 +178,15 @@ type Reporter interface {
 	Codecs() []string
 }
 
+// SourcePriority is an optional Backend extension. It lets a backend move
+// itself for a specific source without changing the global order. The Windows
+// OS backends are ordered for "no system FFmpeg" (WinRT first); when FFmpeg is
+// available it is the better Ogg decoder because it seeks by byte range instead
+// of asking the real-time MediaSource/AudioGraph to reposition.
+type SourcePriority interface {
+	PriorityFor(Source) int
+}
+
 var (
 	registryMu sync.RWMutex
 	registry   = map[string]Backend{}
@@ -223,6 +232,26 @@ func Backends() []Backend {
 		return out[i].Name() < out[j].Name()
 	})
 	return out
+}
+
+// backendsFor orders the registry for one source. Base priority still decides
+// the normal case; SourcePriority may override it per container.
+func backendsFor(src Source) []Backend {
+	out := Backends()
+
+	sort.SliceStable(out, func(i, j int) bool {
+		return priorityFor(out[i], src) < priorityFor(out[j], src)
+	})
+
+	return out
+}
+
+func priorityFor(b Backend, src Source) int {
+	if p, ok := b.(SourcePriority); ok {
+		return p.PriorityFor(src)
+	}
+
+	return b.Priority()
 }
 
 // Default returns the highest-priority backend that can actually run.
@@ -282,17 +311,19 @@ func OpenWith(ctx context.Context, name string, src Source, opts Options) (Strea
 //
 // Priority picks the preferred backend, but platform decoders do not cover
 // every container: Media Foundation and AVFoundation both lack Ogg/Opus and
-// several lossless formats. A backend therefore either rejects the source up
-// front (Guard.Supports) or returns ErrUnsupported from Open, and the next
-// backend is tried. Errors that are not "unsupported" are still recorded and
-// the walk continues, because a platform decoder can fail on a file FFmpeg
-// reads cleanly. The joined error is returned only when every candidate failed.
+// several lossless formats. A backend may also shift its rank for one source
+// (SourcePriority) - Windows prefers FFmpeg for HTTP Ogg when it is present.
+// A backend therefore either rejects the source up front (Guard.Supports) or
+// returns ErrUnsupported from Open, and the next backend is tried. Errors that
+// are not "unsupported" are still recorded and the walk continues, because a
+// platform decoder can fail on a file FFmpeg reads cleanly. The joined error is
+// returned only when every candidate failed.
 func OpenAuto(ctx context.Context, src Source, opts Options) (Stream, Backend, error) {
 	ctx, cancel := withOpenTimeout(ctx, opts)
 	defer cancel()
 
 	var errs []error
-	for _, b := range Backends() {
+	for _, b := range backendsFor(src) {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, err)
 			break

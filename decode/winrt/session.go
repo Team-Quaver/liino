@@ -852,9 +852,16 @@ func (s *stream) seek(t time.Duration) (time.Duration, error) {
 	// Track the actual origin so EOF accounting counts down from the seek
 	// target, not from 0 (otherwise the post-seek tail is treated as a full
 	// track and the clock runs past the end).
+	actual := t
 	s.seekFrames = ticksToFrames(ticks)
 	if pos, err := s.input.position(); err == nil {
 		s.seekFrames = ticksToFrames(pos)
+		// Report where the node actually is, not what was requested. MediaSource
+		// can accept Seek while it is still opening and silently keep 0 for an
+		// HTTP Ogg; returning the request would leave Liino's clock at the
+		// breakpoint while audio restarted from the top (and the renderer could
+		// not notice to correct it).
+		actual = ticksToDuration(pos)
 	}
 	if s.frameNode != nil {
 		// Drop frames the output node buffered at the previous position. The
@@ -862,7 +869,7 @@ func (s *stream) seek(t time.Duration) (time.Duration, error) {
 		// between the position change and this point.
 		_ = s.frameNode.reset()
 	}
-	return t, nil
+	return actual, nil
 }
 
 func (s *stream) Close() error {

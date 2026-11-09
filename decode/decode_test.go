@@ -36,11 +36,53 @@ func (f fakeBackend) Supports(src Source) (bool, string) {
 	return f.supports(src)
 }
 func (f fakeBackend) Codecs() []string { return f.codecs }
+
+type sourcePriorityBackend struct {
+	fakeBackend
+	forSrc Source
+	rank   int
+}
+
+func (b sourcePriorityBackend) PriorityFor(src Source) int {
+	if src.Format == b.forSrc.Format {
+		return b.rank
+	}
+
+	return b.priority
+}
+
 func (f fakeBackend) Open(context.Context, Source, Options) (Stream, error) {
 	if f.openErr != nil {
 		return nil, f.openErr
 	}
 	return fakeStream{name: f.name}, nil
+}
+
+// SourcePriority lets a backend outrank the global order for one container
+// without changing what every other source sees.
+func TestOpenAutoHonoursSourcePriority(t *testing.T) {
+	register(t, fakeBackend{name: "test-os", priority: 0, probeOK: true})
+	register(t, sourcePriorityBackend{
+		fakeBackend: fakeBackend{name: "test-ffmpeg", priority: 10, probeOK: true},
+		forSrc:      Source{Format: "ogg"},
+		rank:        -1,
+	})
+
+	_, b, err := OpenAuto(context.Background(), Source{URI: "https://example.test/x", Format: "ogg"}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Name() != "test-ffmpeg" {
+		t.Fatalf("ogg backend = %s, want test-ffmpeg", b.Name())
+	}
+
+	_, b, err = OpenAuto(context.Background(), Source{URI: "https://example.test/x", Format: "flac"}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Name() != "test-os" {
+		t.Fatalf("flac backend = %s, want test-os", b.Name())
+	}
 }
 
 type fakeStream struct{ name string }
@@ -53,10 +95,10 @@ func (fakeStream) Read() (pcm.Chunk, error) {
 func (fakeStream) Seek(time.Duration) (time.Duration, error) { return 0, ErrSeekUnsupported }
 func (fakeStream) Close() error                              { return nil }
 
-func register(t *testing.T, b fakeBackend) {
+func register(t *testing.T, b Backend) {
 	t.Helper()
 	Register(b)
-	t.Cleanup(func() { Unregister(b.name) })
+	t.Cleanup(func() { Unregister(b.Name()) })
 }
 
 // OpenAuto prefers the lower priority number when it can run.
