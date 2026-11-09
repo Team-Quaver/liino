@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -63,6 +64,15 @@ const (
 
 	// endSlackFrames is how close to the reported end counts as "at the end".
 	endSlackFrames = pcmRate / 5 // 200 ms
+
+	// warmFrames is how much audio a fresh MediaSource must have produced
+	// before a position change is safe. See warmUp.
+	warmFrames = pcmRate / 10 // 100 ms
+
+	// warmTimeout bounds that warm-up. A source that produces nothing in this
+	// window is not warmed: warmUp then lets the ordinary Seek run, and a
+	// failure there rebuilds the pipeline at the target as before.
+	warmTimeout = 2 * time.Second
 )
 
 // job is a unit of work executed on the graph's apartment thread.
@@ -108,7 +118,14 @@ type stream struct {
 	seekFrames     int64 // source position of the first frame after Open or Seek
 	pending        []float32
 
-	running    bool
+	running bool
+	// warm is set once the graph has produced audio since Open. A fresh
+	// MediaSource whose real-time graph has not emitted a frame yet answers
+	// Seek with E_ABORT, or blocks for the MediaSource's internal 5 s timeout
+	// (reproducible on HTTP FLAC: the second FLAC in one process stalls 5 s,
+	// and switching back from Ogg aborts the seek). Once audio has flowed the
+	// same Seek completes in ~2 ms.
+	warm       bool
 	eof        bool
 	finished   bool
 	stallTicks int
@@ -524,6 +541,11 @@ func (s *stream) pump() {
 			break
 		}
 		got++
+		// The graph is producing audio, so a later Seek no longer hits the
+		// cold-MediaSource timeout. Mark it here too: a track that played
+		// without an initial seek must not pay the warm-up on the first
+		// progress-bar drag.
+		s.warm = true
 		s.pending = append(s.pending, data...)
 		s.emitPending(false)
 	}
@@ -845,6 +867,14 @@ func (s *stream) seek(t time.Duration) (time.Duration, error) {
 		s.running = true
 	}
 	ticks := int64(t / (100 * time.Nanosecond))
+	// A MediaSource that has not produced its first frames yet aborts a
+	// position change (E_ABORT) or blocks for its internal 5 s timeout. That is
+	// what made the second FLAC of a session take 5 s to start and the switch
+	// back from Ogg to FLAC land at 0. Once audio has flowed the same Seek
+	// completes in ~2 ms, so warm the graph before repositioning it.
+	if err := s.warmUp(); err != nil {
+		return 0, err
+	}
 	if err := s.input.seek(ticks); err != nil {
 		return 0, fmt.Errorf("winrt: seek: %w", err)
 	}
@@ -870,6 +900,49 @@ func (s *stream) seek(t time.Duration) (time.Duration, error) {
 		_ = s.frameNode.reset()
 	}
 	return actual, nil
+}
+
+// warmUp lets a freshly opened graph produce its first audio before a Seek.
+// The samples are discarded (they are from before the requested position) and
+// the frame node is reset so none of them leak into the output.
+func (s *stream) warmUp() error {
+	// Local files reposition instantly even when cold; warming them would only
+	// add latency. The stall is an HTTP-source property of MediaSource.
+	if s.warm || !isNetworkURI(s.uri) {
+		return nil
+	}
+	deadline := time.Now().Add(warmTimeout)
+	produced := 0
+	for produced < warmFrames {
+		if time.Now().After(deadline) {
+			break
+		}
+		_, frames, err := s.readFrame()
+		if err != nil {
+			return fmt.Errorf("winrt: warm up: %w", err)
+		}
+		if frames == 0 {
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		produced += frames
+	}
+	if s.frameNode != nil {
+		_ = s.frameNode.reset()
+	}
+	if produced == 0 {
+		// Nothing came out in time: fall through to the normal Seek and let
+		// the caller's recovery path deal with whatever is wrong.
+		return nil
+	}
+	s.warm = true
+	return nil
+}
+
+func isNetworkURI(uri string) bool {
+	lower := strings.ToLower(uri)
+
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 func (s *stream) Close() error {
