@@ -1,9 +1,6 @@
 package dsp
 
-import (
-	"errors"
-	"sync"
-)
+import "sync"
 
 // Stage describes one entry of the pipeline for diagnostics.
 type Stage struct {
@@ -38,7 +35,6 @@ type Pipeline struct {
 	rate     float64
 	channels int
 
-	bands     []*band
 	chain     []Processor
 	preamp    *RampGain
 	limiter   *Limiter
@@ -46,11 +42,6 @@ type Pipeline struct {
 	fade      *Fade
 	meter     *Meter
 	bypass    bool
-}
-
-type band struct {
-	cfg Config
-	bq  *Biquad
 }
 
 // NewPipeline builds an empty pipeline at the canonical rate.
@@ -85,9 +76,6 @@ func (p *Pipeline) SetFormat(rate, channels int) {
 		p.rate = float64(rate)
 		p.preamp = NewRampGain(p.rate)
 		p.preamp.SetLinear(gain)
-		for _, b := range p.bands {
-			b.bq.SetRate(p.rate)
-		}
 		if p.limiter != nil {
 			p.limiter.Reset()
 		}
@@ -116,47 +104,6 @@ func (p *Pipeline) Volume() float64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.preamp.Linear()
-}
-
-// SetBands installs the EQ. Existing filters keep their internal state when the
-// count and kinds match, so dragging a band while playing does not click.
-func (p *Pipeline) SetBands(configs []Config) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	next := make([]*band, 0, len(configs))
-	for i, cfg := range configs {
-		if cfg.Freq <= 0 {
-			return errors.New("dsp: band frequency must be positive")
-		}
-		if cfg.Q <= 0 {
-			cfg.Q = 1
-		}
-		if i < len(p.bands) && p.bands[i].cfg.Shelf == cfg.Shelf {
-			reuse := p.bands[i]
-			reuse.bq.Update(cfg.Freq, cfg.Q, cfg.Gain)
-			reuse.cfg = cfg
-			next = append(next, reuse)
-			continue
-		}
-		bq, err := cfg.NewBiquad(p.rate)
-		if err != nil {
-			return err
-		}
-		next = append(next, &band{cfg: cfg, bq: bq})
-	}
-	p.bands = next
-	return nil
-}
-
-// Bands reports the current EQ configuration.
-func (p *Pipeline) Bands() []Config {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	out := make([]Config, 0, len(p.bands))
-	for _, b := range p.bands {
-		out = append(out, b.cfg)
-	}
-	return out
 }
 
 // SetLimiter enables or re-tunes the safety limiter.
@@ -241,9 +188,6 @@ func (p *Pipeline) Process(data []float32, channels int) {
 	if channels <= 0 {
 		channels = p.channels
 	}
-	for _, b := range p.bands {
-		b.bq.Process(data, channels)
-	}
 	for _, proc := range p.chain {
 		if proc != nil {
 			proc.Process(data, channels)
@@ -270,9 +214,6 @@ func (p *Pipeline) Reset() {
 }
 
 func (p *Pipeline) resetLocked() {
-	for _, b := range p.bands {
-		b.bq.Reset()
-	}
 	for _, proc := range p.chain {
 		if proc != nil {
 			proc.Reset()
@@ -294,13 +235,9 @@ func (p *Pipeline) State() State {
 		Channels:   p.channels,
 		Bypass:     p.bypass,
 		PreampDB:   p.preamp.DB(),
-		Bands:      make([]Config, 0, len(p.bands)),
 		Limiter:    p.limiterOn,
 		ChainLen:   len(p.chain),
 		FadeDone:   p.fade == nil || p.fade.Done(),
-	}
-	for _, b := range p.bands {
-		st.Bands = append(st.Bands, b.cfg)
 	}
 	if p.fade != nil {
 		switch p.fade.kind {
@@ -311,7 +248,6 @@ func (p *Pipeline) State() State {
 		}
 	}
 	st.Stages = append(st.Stages,
-		Stage{Kind: "eq", Enabled: len(st.Bands) > 0, Detail: itoa(len(st.Bands)) + " bands"},
 		Stage{Kind: "chain", Enabled: st.ChainLen > 0, Detail: itoa(st.ChainLen) + " processors"},
 		Stage{Kind: "gain", Enabled: true, Detail: ftoa(st.PreampDB) + " dB"},
 		Stage{Kind: "limiter", Enabled: st.Limiter},

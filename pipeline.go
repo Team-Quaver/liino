@@ -31,6 +31,7 @@ func (p *Player) Read(dst []float32) int {
 	if inCh == outCh {
 		n := pipe.Read(dst)
 		if n > 0 {
+			p.outEQ.Process(dst[:n*outCh], outCh)
 			p.outGain.Process(dst[:n*outCh], outCh)
 			p.pulled.Add(uint64(n))
 		}
@@ -50,6 +51,7 @@ func (p *Player) Read(dst []float32) int {
 		return 0
 	}
 	pcm.MapChannels(dst[:n*outCh], buf[:n*inCh], n, inCh, outCh)
+	p.outEQ.Process(dst[:n*outCh], outCh)
 	p.outGain.Process(dst[:n*outCh], outCh)
 	p.pulled.Add(uint64(n))
 	return n

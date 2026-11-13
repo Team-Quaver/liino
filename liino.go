@@ -163,6 +163,10 @@ type Player struct {
 	// volume move is heard immediately instead of waiting for seconds of
 	// already-processed audio to drain.
 	outGain *dsp.AtomicGain
+	// outEQ is the consumer-side equalizer, for the same reason as outGain: the
+	// ring holds seconds of decoded audio, so bands applied in the decode path
+	// were not heard until that backlog drained. Retargeting it is lock-free.
+	outEQ *dsp.EQ
 
 	chain *dsp.Pipeline
 	hub   *eventBus
@@ -236,6 +240,7 @@ func New(cfg Config) (*Player, error) {
 		cfg:     cfg,
 		chain:   dsp.NewPipeline(pcm.DefaultSampleRate, pcm.DefaultChannels),
 		outGain: dsp.NewAtomicGain(pcm.DefaultSampleRate),
+		outEQ:   dsp.NewEQ(pcm.DefaultSampleRate),
 		hub:     newEventBus(),
 		clock:   newClock(pcm.DefaultSampleRate),
 		quit:    make(chan struct{}),
@@ -245,13 +250,13 @@ func New(cfg Config) (*Player, error) {
 	}
 	p.pipe.Store(pcm.NewPipe(cfg.RingFrames, pcm.DefaultFormat()))
 	p.outChannels.Store(int32(pcm.DefaultChannels))
-	// User volume lives on the consumer side; the producer chain stays at
-	// unity (EQ bands still run there). Preamp is folded into the gain value by
-	// the host, so it lands here too.
+	// User volume and EQ live on the consumer side; the producer chain stays at
+	// unity. Preamp is folded into the gain value by the host, so it lands here
+	// too.
 	p.outGain.SetLinear(cfg.Volume)
 	p.outGain.Snap()
 	if len(cfg.EQ) > 0 {
-		if err := p.chain.SetBands(cfg.EQ); err != nil {
+		if err := p.outEQ.SetBands(cfg.EQ); err != nil {
 			return nil, fmt.Errorf("%w: eq: %v", ErrInvalidConfig, err)
 		}
 	}
@@ -315,6 +320,7 @@ func (p *Player) Open(ctx context.Context, src decode.Source, opts OpenOptions) 
 	p.stream = nil
 	p.pipe.Load().Swap(gen)
 	p.chain.Reset()
+	p.outEQ.Reset()
 	p.nudge()
 	p.mu.Unlock()
 
@@ -510,6 +516,7 @@ func (p *Player) hardStopIf(trackGen uint64) {
 	p.pipe.Load().Interrupt()
 	p.pipe.Load().Reset()
 	p.chain.Reset()
+	p.outEQ.Reset()
 	stream := p.stream
 	p.stream = nil
 	out := p.out
@@ -576,6 +583,7 @@ func (p *Player) Seek(d time.Duration) error {
 	p.bufferAt = 0
 	p.eof = false
 	p.chain.Reset()
+	p.outEQ.Reset()
 	p.pipe.Load().Reset()
 	p.pipe.Load().Interrupt()
 	stream := p.stream
@@ -819,16 +827,16 @@ func (p *Player) Muted() bool {
 	return p.muted
 }
 
-// SetEQ installs the band list. Filters keep their state where the count and
-// types match, so EQ changes do not restart decoding or click.
+// SetEQ installs the band list. It takes no lock: the bands are published to the
+// consumer-side equalizer through an atomic pointer, so a slider drag is heard
+// on the next callback instead of waiting for the ring to drain, and it can
+// never queue behind a device open or a network seek holding mu.
 func (p *Player) SetEQ(bands []dsp.Config) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.chain.SetBands(bands)
+	return p.outEQ.SetBands(bands)
 }
 
 // EQ reports the current bands.
-func (p *Player) EQ() []dsp.Config { return p.chain.Bands() }
+func (p *Player) EQ() []dsp.Config { return p.outEQ.Bands() }
 
 // SetEffects replaces the user effects chain that runs after the EQ.
 func (p *Player) SetEffects(chain []dsp.Processor) { p.chain.SetChain(chain) }
@@ -840,11 +848,24 @@ func (p *Player) SetLimiter(on bool) {
 	p.chain.SetLimiter(on, p.cfg.LimiterDB, p.cfg.LimiterAttack, p.cfg.LimiterRelease)
 }
 
-// SetBypass is a true bypass of the whole DSP chain.
-func (p *Player) SetBypass(bypass bool) { p.chain.SetBypass(bypass) }
+// SetBypass is a true bypass of the whole DSP chain, on both sides of the ring.
+func (p *Player) SetBypass(bypass bool) {
+	p.chain.SetBypass(bypass)
+	p.outEQ.SetBypass(bypass)
+}
 
-// DSPState snapshots the chain for the settings UI.
-func (p *Player) DSPState() dsp.State { return p.chain.State() }
+// DSPState snapshots the chain for the settings UI. The EQ stage is reported
+// from the consumer-side equalizer, which is where the bands actually run.
+func (p *Player) DSPState() dsp.State {
+	st := p.chain.State()
+	bands := p.outEQ.Bands()
+	st.Bands = bands
+	st.Bypass = st.Bypass || p.outEQ.Bypass()
+	st.Stages = append([]dsp.Stage{
+		{Kind: "eq", Enabled: len(bands) > 0 && !p.outEQ.Bypass(), Detail: fmt.Sprintf("%d bands", len(bands))},
+	}, st.Stages...)
+	return st
+}
 
 // Level drains the meter window: peaks, RMS and clip count since the last call.
 func (p *Player) Level() dsp.Level { return p.chain.Level() }
@@ -884,6 +905,7 @@ func (p *Player) SetDevice(id string) error {
 	p.pipe.Load().Interrupt()
 	p.pipe.Load().Reset()
 	p.chain.Reset()
+	p.outEQ.Reset()
 	p.clock.rebase(pos, 0)
 	p.pulled.Store(0)
 
@@ -1081,6 +1103,7 @@ func (p *Player) reopenIf(loadGen, seekGen uint64, at time.Duration, resume bool
 	p.loopAlive = true
 	p.pipe.Load().Swap(gen)
 	p.chain.Reset()
+	p.outEQ.Reset()
 	stream := p.stream
 	p.stream = nil
 	p.mu.Unlock()

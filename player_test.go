@@ -934,6 +934,75 @@ func TestPlayerReadAppliesVolumeToBufferedFrames(t *testing.T) {
 	}
 }
 
+// Same contract as the volume test above, for the equalizer. The decode path
+// runs ahead and keeps the ring full, so bands installed before the ring are
+// not heard until seconds of already-filtered audio drain: dragging a slider or
+// flipping EQ off looked like a multi-second dead zone. EQ must therefore act
+// on frames that are already buffered.
+func TestPlayerReadAppliesEQToBufferedFrames(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	pipe := pcm.NewPipe(4800, pcm.DefaultFormat())
+	pipe.Swap(0)
+	p.pipe.Store(pipe)
+	p.outChannels.Store(pcm.DefaultChannels)
+
+	frames := 240
+	// Nyquist-rate square wave: a high shelf attenuates it hard, so whether the
+	// bands ran on these buffered frames is unambiguous.
+	buffered := func() []float32 {
+		data := make([]float32, frames*2)
+		for frame := 0; frame < frames; frame++ {
+			value := float32(0.8)
+			if frame%2 == 1 {
+				value = -0.8
+			}
+			data[frame*2], data[frame*2+1] = value, value
+		}
+		return data
+	}
+	peakOf := func(data []float32) float64 {
+		var peak float64
+		for _, sample := range data {
+			peak = math.Max(peak, math.Abs(float64(sample)))
+		}
+		return peak
+	}
+
+	if _, err := pipe.WriteFrames(0, buffered(), frames); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetEQ([]dsp.Config{{Freq: 1000, Gain: -24, Shelf: "highshelf"}}); err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]float32, frames*2)
+	if n := p.Read(dst); n != frames {
+		t.Fatalf("read frames = %d, want %d", n, frames)
+	}
+	if peak := peakOf(dst[frames:]); peak > 0.3 {
+		t.Fatalf("peak = %v, want the band applied to already-buffered frames", peak)
+	}
+
+	// Turning EQ off (the host clears the band list) must be just as immediate.
+	if _, err := pipe.WriteFrames(0, buffered(), frames); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetEQ(nil); err != nil {
+		t.Fatal(err)
+	}
+	plain := make([]float32, frames*2)
+	if n := p.Read(plain); n != frames {
+		t.Fatalf("read frames = %d, want %d", n, frames)
+	}
+	if peak := peakOf(plain); math.Abs(peak-0.8) > 1e-6 {
+		t.Fatalf("peak with EQ off = %v, want 0.8 (bands still filtering)", peak)
+	}
+}
+
 func TestPlayerPauseResumeAndStop(t *testing.T) {
 	fake := &fakeBackend{}
 	registerFake(t, fake)
