@@ -35,8 +35,13 @@ var (
 	ErrClosed = errors.New("output: closed")
 )
 
-// DefaultPeriodFrames is 5 ms at 48 kHz, the granularity every driver accepts.
-const DefaultPeriodFrames = 240
+// DefaultPeriodFrames is 1024 frames (21.3 ms at 48 kHz), matching the
+// conventional PipeWire graph quantum. This doubles as the amount the pipeline
+// hands the callback each cycle, so it is also the client-side slack when the
+// host process is busy. The previous 240-frame (5 ms) chunk left only 5 ms of
+// queued audio: any scheduling delay past that starved the graph mid-cycle and
+// came out as a dropout/crackle under load.
+const DefaultPeriodFrames = 1024
 
 // Device is one selectable output endpoint.
 type Device struct {

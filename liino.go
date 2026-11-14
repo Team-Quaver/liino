@@ -46,8 +46,8 @@ import (
 // Version is the library version, surfaced to Node over the FFI boundary.
 const Version = "0.1.0"
 
-// Defaults for a desktop music player: 5 s of buffer, 50 ms preroll, 5 ms
-// periods, and a device sanity check every 2 s.
+// Defaults for a desktop music player: 5 s of buffer, 50 ms preroll, 21 ms
+// periods (one PipeWire quantum), and a device sanity check every 2 s.
 const (
 	DefaultRingFrames      = pcm.DefaultSampleRate * 5
 	DefaultPrerollFrames   = pcm.ChunkFrames

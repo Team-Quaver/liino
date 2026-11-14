@@ -156,11 +156,21 @@ func (p *Pipe) write(token uint64, data []float32, frames int) (int, error) {
 			return written, ErrPipeInterrupted
 		}
 		n := min(p.capacity-p.count, frames-written)
-		for i := 0; i < n; i++ {
-			idx := (p.start + p.count + i) % p.capacity
-			src := (written + i) * ch
-			copy(p.buf[idx*ch:(idx+1)*ch], data[src:src+ch])
+		// Copy contiguous runs, not one frame at a time: the producer holds
+		// this mutex, and the audio callback takes it on every Read. A shorter
+		// critical section is the difference between a microsecond and a
+		// preemption-window stall in the callback.
+		head := (p.start + p.count) % p.capacity
+		first := min(n, p.capacity-head)
+		src := written * ch
+		copy(p.buf[head*ch:(head+first)*ch], data[src:src+first*ch])
+
+		if first < n {
+			rest := n - first
+			src += first * ch
+			copy(p.buf[:rest*ch], data[src:src+rest*ch])
 		}
+
 		p.count += n
 		written += n
 		p.notEmpty.Signal()
@@ -181,9 +191,13 @@ func (p *Pipe) Read(dst []float32) int {
 	if n == 0 {
 		return 0
 	}
-	for i := 0; i < n; i++ {
-		idx := (p.start + i) % p.capacity
-		copy(dst[i*ch:(i+1)*ch], p.buf[idx*ch:(idx+1)*ch])
+	// The callback runs this on every period, so copy at most two contiguous
+	// runs instead of touching every frame individually.
+	first := min(n, p.capacity-p.start)
+	copy(dst[:first*ch], p.buf[p.start*ch:(p.start+first)*ch])
+	if first < n {
+		rest := n - first
+		copy(dst[first*ch:(first+rest)*ch], p.buf[:rest*ch])
 	}
 	p.start = (p.start + n) % p.capacity
 	p.count -= n

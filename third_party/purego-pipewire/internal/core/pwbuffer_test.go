@@ -225,9 +225,11 @@ func TestNewPWBufferViewRejectsNilSpaBuffer(t *testing.T) {
 	}
 }
 
-// TestNewPWBufferViewRejectsOversizedFrames verifies that requesting more
-// frames than the buffer can hold (based on Maxsize) returns ErrFrameOverflow.
-func TestNewPWBufferViewRejectsOversizedFrames(t *testing.T) {
+// TestNewPWBufferViewClampsOversizedFrames verifies that requesting more
+// frames than the buffer can hold (based on Maxsize) clamps to the capacity
+// instead of failing the stream. A graph negotiated for low latency hands out
+// smaller buffers, and a hard error there would kill playback outright.
+func TestNewPWBufferViewClampsOversizedFrames(t *testing.T) {
 	const channels = 2
 	const maxFrames = 32
 	const requestedFrames = 64 // exceeds maxFrames
@@ -255,9 +257,17 @@ func TestNewPWBufferViewRejectsOversizedFrames(t *testing.T) {
 	}
 	pwBuf := pwBuffer{Buffer: &buf}
 
-	_, err := newPWBufferView(unsafe.Pointer(&pwBuf), channels, requestedFrames)
-	if !errors.Is(err, ErrFrameOverflow) {
-		t.Fatalf("expected ErrFrameOverflow, got %v", err)
+	view, err := newPWBufferView(unsafe.Pointer(&pwBuf), channels, requestedFrames)
+	if err != nil {
+		t.Fatalf("expected clamped view, got error %v", err)
+	}
+	if view.frames != maxFrames || view.PCM().Frames != maxFrames {
+		t.Fatalf("expected %d frames, got view.frames=%d pcm.frames=%d", maxFrames, view.frames, view.PCM().Frames)
+	}
+	for ch := 0; ch < channels; ch++ {
+		if got := len(view.PCM().Samples[ch]); got != maxFrames {
+			t.Fatalf("channel %d length = %d, want %d", ch, got, maxFrames)
+		}
 	}
 }
 

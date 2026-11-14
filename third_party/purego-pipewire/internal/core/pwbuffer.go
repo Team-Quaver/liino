@@ -54,9 +54,13 @@ type pwBufferView struct {
 	buf      *pwBuffer
 	channels int
 	frames   int
-	data     []spaData
-	pcm      PCMBuffer
-	samples  [][]float32
+	// wantFrames is the configured callback size. refresh may lower frames
+	// when PipeWire hands us a smaller buffer (a low-latency graph quantum),
+	// but the ceiling survives so a later larger buffer is used in full.
+	wantFrames int
+	data       []spaData
+	pcm        PCMBuffer
+	samples    [][]float32
 }
 
 var (
@@ -76,8 +80,9 @@ func newReusablePWBufferView(channels, frames int) pwBufferView {
 		samples = make([][]float32, channels)
 	}
 	return pwBufferView{
-		channels: channels,
-		frames:   frames,
+		channels:   channels,
+		frames:     frames,
+		wantFrames: frames,
 		pcm: PCMBuffer{
 			Frames:   frames,
 			Channels: channels,
@@ -122,22 +127,33 @@ func (v *pwBufferView) refresh(bufPtr unsafe.Pointer) error {
 	// Datas is a pointer to a C array of spaData structs. unsafe.Slice creates
 	// only a slice header; it does not copy or allocate the native metadata.
 	dataSlice := unsafe.Slice((*spaData)(pw.Buffer.Datas), int(pw.Buffer.NDatas))
+	// Clamp to what this buffer can actually hold instead of failing the
+	// stream: a graph negotiated for low latency (small quantum) hands out
+	// smaller buffers, and a callback that filled past the end of the mapping
+	// would corrupt memory. The clamp only lowers this callback's fill size;
+	// wantFrames keeps the configured ceiling for larger buffers.
+	frames := v.wantFrames
 	for i := 0; i < v.channels; i++ {
 		data := &dataSlice[i]
 		if data.Data == nil {
 			v.clear()
 			return ErrUnmappedData
 		}
-		maxFrames := int(data.Maxsize) / 4
-		if v.frames > maxFrames {
-			v.clear()
-			return fmt.Errorf("%w: requested %d frames but buffer holds %d", ErrFrameOverflow, v.frames, maxFrames)
+		if maxFrames := int(data.Maxsize) / 4; maxFrames < frames {
+			frames = maxFrames
 		}
-		// The length and capacity intentionally match the configured callback
-		// frame count, preserving the previous view contract even if PipeWire
-		// supplied a larger mapped buffer.
-		v.samples[i] = unsafe.Slice((*float32)(data.Data), v.frames)
 	}
+	if frames <= 0 {
+		v.clear()
+		return fmt.Errorf("%w: buffer holds no frames", ErrFrameOverflow)
+	}
+	for i := 0; i < v.channels; i++ {
+		// The length and capacity intentionally match the callback frame count,
+		// not the whole mapped buffer: the pump only ever writes this many.
+		v.samples[i] = unsafe.Slice((*float32)(dataSlice[i].Data), frames)
+	}
+	v.frames = frames
+	v.pcm.Frames = frames
 	v.buf = pw
 	v.data = dataSlice
 	return nil
