@@ -18,6 +18,8 @@ type StreamProperties struct {
 	AppName    string // application.name
 	StreamName string // media.name
 	MediaRole  string // media.role ("Music", "Movie", ...)
+	// Rate asks the graph for node.rate = 1/Rate. Zero keeps the daemon's clock.
+	Rate int
 }
 
 // StreamOps defines the outbound interface for PipeWire stream lifecycle

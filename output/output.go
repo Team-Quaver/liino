@@ -85,6 +85,10 @@ type Options struct {
 	StreamName   string     // track title or "playback"
 	Source       Source     // required
 
+	// AdaptiveRate asks PipeWire to move the graph to Format.SampleRate
+	// (node.rate); otherwise it keeps its clock and resamples.
+	AdaptiveRate bool
+
 	// OnUnderrun reports frames the pipeline could not supply.
 	OnUnderrun func(missing int)
 	// OnError reports async failures (device lost, stream error).

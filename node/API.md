@@ -38,9 +38,14 @@ player.close();
 
 ## Shapes
 
-- `create(config)` config keys: `decoder`, `driver`, `device_id`, `app_name`,
-  `stream_name`, `ring_seconds`, `preroll_ms`, `period_ms`, `fade_out_ms`,
-  `volume`, `limiter`, `limiter_db`, `eq`.
+- `create(config)` config keys: `decoder`, `driver`, `device_id`,
+  `adaptive_rate`, `switch_device_rate`, `app_name`, `stream_name`,
+  `ring_seconds`, `preroll_ms`, `period_ms`, `fade_out_ms`, `volume`,
+  `limiter`, `limiter_db`, `eq`.
+  `adaptive_rate: true` keeps the source clock end to end (on Linux the
+  PipeWire stream runs at the song's rate); `switch_device_rate: true` also asks
+  the graph to move the hardware clock (may pause on slow devices). Both apply
+  to the next `open()`.
 - `snapshot()` returns `{ state, position_ms, duration_ms, buffered_ms,
   volume, muted, driver, device, decoder, codec, sample_rate, channels,
   underruns, clips, peak_l_db, peak_r_db, live }`. `channels` is the source

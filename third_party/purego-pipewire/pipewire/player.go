@@ -70,6 +70,10 @@ type PlayerConfig struct {
 	AppName    string
 	StreamName string
 	MediaRole  string
+	// AdaptiveRate asks the graph to run at SampleRate (node.rate). PipeWire
+	// switches the driver when default.clock.allowed-rates allows it and the
+	// device is free; otherwise it keeps its rate and resamples this stream.
+	AdaptiveRate bool
 }
 
 // PCMBuffer represents a buffer of PCM audio data.
@@ -219,6 +223,7 @@ func NewPlayer(config PlayerConfig, callbacks PlayerCallbacks) (Player, error) {
 		AppName:         config.AppName,
 		StreamName:      config.StreamName,
 		MediaRole:       config.MediaRole,
+		AdaptiveRate:    config.AdaptiveRate,
 	}
 	p.internal = core.NewPlayer(coreConfig, coreCallbacks)
 

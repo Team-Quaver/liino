@@ -99,6 +99,11 @@ upstream import path.
    OS mixer show **Quaver Music** instead of the host process name
    (`electron`); the daemon otherwise derives `application.name` from
    `pw_get_prgname()` (a Node `process.title` change does not reach it).
+4. `PlayerConfig` gained `AdaptiveRate`; when set, `StreamProperties` carries
+   the requested rate and `internal/capi` adds `node.rate=1/<rate>` to the
+   stream node. Without that property PipeWire keeps the graph at its default
+   clock and resamples the stream even when `default.clock.allowed-rates`
+   lists the song's rate (mpv requests it the same way).
 
 ### Why
 

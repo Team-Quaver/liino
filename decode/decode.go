@@ -1,9 +1,10 @@
 // Package decode defines the decoder boundary of the Liino pipeline.
 //
-// A Backend turns a Source into a Stream of canonical PCM: interleaved
-// float32 at 48 kHz, keeping the source's channel count (see package pcm).
-// Everything downstream - DSP, buffering, device output - only ever sees that
-// shape, so adding a decoder never touches the playback engine. The player
+// A Backend turns a Source into a Stream of float32 PCM at 48 kHz (or at the
+// source rate when Options.FollowSource is set), keeping the source's channel
+// count (see package pcm). Everything downstream - DSP, buffering, device
+// output - only ever sees that shape, so adding a decoder never touches the
+// playback engine. The player
 // folds channels to the endpoint's layout when they differ; decoders must not
 // downmix themselves, because swresample cannot rematrix layouts it does not
 // know (7.1.4 Opus reports 12 channels with no layout).
@@ -144,6 +145,13 @@ type Options struct {
 	OpenTimeout time.Duration
 	// ChunkFrames is the preferred frame count per returned chunk.
 	ChunkFrames int
+	// SampleRate is the rate the backend should produce. Zero means the
+	// canonical 48 kHz; it is ignored when FollowSource is set.
+	SampleRate int
+	// FollowSource asks the backend to keep the decoded source clock instead of
+	// resampling to a fixed rate. Backends that cannot change their output rate
+	// ignore it and keep producing their canonical format.
+	FollowSource bool
 	// Log receives backend diagnostics when non-nil.
 	Log func(string)
 }

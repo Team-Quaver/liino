@@ -36,13 +36,15 @@ Liino 是 Quaver Music / Quaver Music Astra 的下一代音频后端，用纯 Go
   `codecs` 字段。Linux 上通过 `avcodec_find_decoder_by_name` 实测已安装 FFmpeg
   实际编入的解码器（mp3/aac/flac/opus/vorbis/dts/truehd/…），
   发行版精简 libavcodec 时不会静默失败。
-- **PCM 管线**：统一转成 48 kHz / float32 交织，保留源声道数（5.1、7.1、7.1.4…）；
+- **PCM 管线**：默认统一转成 48 kHz / float32 交织（`Config.AdaptiveRate` 开启时保留源采样率），
+  保留源声道数（5.1、7.1、7.1.4…）；
   输出端能承载多声道时原样送出（PipeWire 由 graph 决定是否下混），否则在播放器里
   折成双声道。环形缓冲解耦解码与设备回调。
 - **DSP**：增益 → 效果器链（双二阶 EQ、限幅器等），纯 Go 实现。
 - **输出**：`Output` 接口 + 平台注册表。
   - Linux：PipeWire（[purego-pipewire](https://github.com/bnema/purego-pipewire)，`CGO_ENABLED=0`），
-    不用 ALSA。
+    不用 ALSA。`AdaptiveRate` 保留源采样率；`SwitchDeviceRate` 才请求 `node.rate` 切声卡
+    （默认关，慢设备可能短暂静音）。
   - Windows：WASAPI 共享模式（[audio-go](https://github.com/vcaesar/audio-go)），
     随进程走，不破坏系统定向音频捕获（loopback）。
   - macOS：Core Audio（同一 audio-go 后端）。

@@ -123,7 +123,8 @@ func maxF(a, b float64) float64 {
 // volume before the ring made slider moves inaudible until the buffer drained.
 type AtomicGain struct {
 	target   atomic.Uint64 // math.Float64bits(target gain)
-	gain     float64       // audio-thread only
+	rateReq  atomic.Int32
+	gain     float64 // audio-thread only
 	rate     float64
 	rampSecs float64
 }
@@ -134,8 +135,16 @@ func NewAtomicGain(rate int) *AtomicGain {
 		rate = 48000
 	}
 	g := &AtomicGain{rate: float64(rate), rampSecs: 0.02, gain: 1}
+	g.rateReq.Store(int32(rate))
 	g.target.Store(math.Float64bits(1))
 	return g
+}
+
+// SetSampleRate moves the ramp onto a new pipeline clock.
+func (g *AtomicGain) SetSampleRate(rate int) {
+	if rate > 0 {
+		g.rateReq.Store(int32(rate))
+	}
 }
 
 // SetLinear moves the target gain (0 = silence, 1 = unity, >1 headroom).
@@ -169,6 +178,9 @@ func (g *AtomicGain) Snap() { g.gain = g.Linear() }
 func (g *AtomicGain) Process(data []float32, channels int) {
 	if len(data) == 0 {
 		return
+	}
+	if requested := int(g.rateReq.Load()); requested > 0 && requested != int(g.rate) {
+		g.rate = float64(requested)
 	}
 	if g.rate <= 0 {
 		g.rate = 48000

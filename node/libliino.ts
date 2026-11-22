@@ -91,6 +91,10 @@ export interface PlayerConfig {
   decoder?: string;
   driver?: string;
   device_id?: string;
+  /** Follow the source sample rate (decoder, ring, DSP and output clock). */
+  adaptive_rate?: boolean;
+  /** Also ask the device/graph to move to that rate (may pause on slow devices). */
+  switch_device_rate?: boolean;
   app_name?: string;
   stream_name?: string;
   ring_seconds?: number;
@@ -145,6 +149,8 @@ export class Liino {
   private readonly setLimiterFn: KoffiFunction;
   private readonly setBypassFn: KoffiFunction;
   private readonly setDeviceFn: KoffiFunction;
+  private readonly setAdaptiveRateFn: KoffiFunction;
+  private readonly setSwitchDeviceRateFn: KoffiFunction;
   private readonly snapshotFn: KoffiFunction;
   private readonly clockFn: KoffiFunction;
   private readonly levelFn: KoffiFunction;
@@ -178,6 +184,8 @@ export class Liino {
     this.setLimiterFn = this.lib.func('int liino_set_limiter(void *player, int enabled, _Out_ LiinoHeapStr *err)');
     this.setBypassFn = this.lib.func('int liino_set_bypass(void *player, int bypass, _Out_ LiinoHeapStr *err)');
     this.setDeviceFn = this.lib.func('int liino_set_device(void *player, const char *device_id, _Out_ LiinoHeapStr *err)');
+    this.setAdaptiveRateFn = this.lib.func('int liino_set_adaptive_rate(void *player, int on, _Out_ LiinoHeapStr *err)');
+    this.setSwitchDeviceRateFn = this.lib.func('int liino_set_switch_device_rate(void *player, int on, _Out_ LiinoHeapStr *err)');
     this.snapshotFn = this.lib.func('int liino_snapshot_json(void *player, _Out_ LiinoHeapStr *out)');
     this.clockFn = this.lib.func('int liino_clock_json(void *player, _Out_ LiinoHeapStr *out)');
     this.levelFn = this.lib.func('int liino_level_json(void *player, _Out_ LiinoHeapStr *out)');
@@ -259,6 +267,14 @@ export class LiinoPlayer {
   setDevice(deviceID?: string): void {
     this.#call((this.#lib as unknown as { setDeviceFn: KoffiFunction }).setDeviceFn,
       this.#handle, deviceID ?? '');
+  }
+  setAdaptiveRate(on: boolean): void {
+    this.#call((this.#lib as unknown as { setAdaptiveRateFn: KoffiFunction }).setAdaptiveRateFn,
+      this.#handle, on ? 1 : 0);
+  }
+  setSwitchDeviceRate(on: boolean): void {
+    this.#call((this.#lib as unknown as { setSwitchDeviceRateFn: KoffiFunction }).setSwitchDeviceRateFn,
+      this.#handle, on ? 1 : 0);
   }
 
   snapshot(): string | null {

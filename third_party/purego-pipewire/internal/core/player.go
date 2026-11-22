@@ -188,6 +188,9 @@ func (p *player) startCreateResourcesAndActivate() error {
 		StreamName: p.config.StreamName,
 		MediaRole:  p.config.MediaRole,
 	}
+	if p.config.AdaptiveRate {
+		props.Rate = p.config.SampleRate
+	}
 	streamPtr, err := p.streamOps.CreatePlaybackStream(loopPtr, name, props, p.onProcess)
 	if err != nil {
 		p.streamOps.DestroyMainLoop(loopPtr)

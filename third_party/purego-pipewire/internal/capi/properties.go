@@ -1,6 +1,7 @@
 package capi
 
 import (
+	"fmt"
 	"runtime"
 	"unsafe"
 
@@ -72,6 +73,10 @@ func buildStreamProperties(props portout.StreamProperties, fallbackName string) 
 	add("node.name", props.AppName)
 	add("node.description", props.AppName)
 	add("media.role", props.MediaRole)
+	if props.Rate > 0 {
+		// PipeWire switches only when allowed-rates and the device permit it.
+		add("node.rate", fmt.Sprintf("1/%d", props.Rate))
+	}
 	if len(items) == 0 {
 		return nil
 	}

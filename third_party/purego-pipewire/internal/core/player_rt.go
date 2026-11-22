@@ -48,6 +48,10 @@ type PlayerConfig struct {
 	AppName    string
 	StreamName string
 	MediaRole  string
+	// AdaptiveRate asks the graph to run at SampleRate (node.rate). PipeWire
+	// switches the driver when default.clock.allowed-rates allows it and the
+	// device is free; otherwise it keeps its rate and resamples this stream.
+	AdaptiveRate bool
 }
 
 // PlayerCallbacks holds callbacks for player events

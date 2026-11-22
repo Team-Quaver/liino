@@ -54,6 +54,12 @@ int liino_set_bypass(liino_player *player, int bypass, char **err);
 
 /* Routing and status. */
 int liino_set_device(liino_player *player, const char *device_id, char **err);
+
+/* Follow the source sample rate for the next Open (1 = on, 0 = pin 48 kHz). */
+int liino_set_adaptive_rate(liino_player *player, int on, char **err);
+
+/* Also move the hardware clock to the source rate (1 = on, 0 = let PipeWire resample). */
+int liino_set_switch_device_rate(liino_player *player, int on, char **err);
 int liino_snapshot_json(liino_player *player, char **out_json);
 int liino_clock_json(liino_player *player, char **out_json);
 int liino_level_json(liino_player *player, char **out_json);

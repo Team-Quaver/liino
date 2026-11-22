@@ -111,19 +111,21 @@ func liino_create(configJSON *C.char, errp **C.char) *C.struct_liino_player {
 	cfg := liino.Config{AppName: "Quaver Music"}
 	if configJSON != nil {
 		var in struct {
-			Decoder     string  `json:"decoder"`
-			Driver      string  `json:"driver"`
-			DeviceID    string  `json:"device_id"`
-			AppName     string  `json:"app_name"`
-			StreamName  string  `json:"stream_name"`
-			RingSeconds float64 `json:"ring_seconds"`
-			PrerollMS   int     `json:"preroll_ms"`
-			PeriodMS    int     `json:"period_ms"`
-			FadeOutMS   int     `json:"fade_out_ms"`
-			Volume      float64 `json:"volume"`
-			Limiter     bool    `json:"limiter"`
-			LimiterDB   float64 `json:"limiter_db"`
-			EQ          []struct {
+			Decoder          string  `json:"decoder"`
+			Driver           string  `json:"driver"`
+			DeviceID         string  `json:"device_id"`
+			AdaptiveRate     bool    `json:"adaptive_rate"`
+			SwitchDeviceRate bool    `json:"switch_device_rate"`
+			AppName          string  `json:"app_name"`
+			StreamName       string  `json:"stream_name"`
+			RingSeconds      float64 `json:"ring_seconds"`
+			PrerollMS        int     `json:"preroll_ms"`
+			PeriodMS         int     `json:"period_ms"`
+			FadeOutMS        int     `json:"fade_out_ms"`
+			Volume           float64 `json:"volume"`
+			Limiter          bool    `json:"limiter"`
+			LimiterDB        float64 `json:"limiter_db"`
+			EQ               []struct {
 				Freq  float64 `json:"freq"`
 				Q     float64 `json:"q"`
 				Gain  float64 `json:"gain"`
@@ -139,6 +141,8 @@ func liino_create(configJSON *C.char, errp **C.char) *C.struct_liino_player {
 		cfg.Decoder = in.Decoder
 		cfg.Driver = in.Driver
 		cfg.DeviceID = in.DeviceID
+		cfg.AdaptiveRate = in.AdaptiveRate
+		cfg.SwitchDeviceRate = in.SwitchDeviceRate
 		if in.AppName != "" {
 			cfg.AppName = in.AppName
 		}
@@ -347,6 +351,22 @@ func liino_set_device(key *C.struct_liino_player, deviceID *C.char, errp **C.cha
 	}
 	go func() { _ = h.player.SetDevice(id) }()
 	return codeOK
+}
+
+//export liino_set_adaptive_rate
+func liino_set_adaptive_rate(key *C.struct_liino_player, on C.int, errp **C.char) C.int {
+	return call(key, errp, func(h *handle) error {
+		h.player.SetAdaptiveRate(on != 0)
+		return nil
+	})
+}
+
+//export liino_set_switch_device_rate
+func liino_set_switch_device_rate(key *C.struct_liino_player, on C.int, errp **C.char) C.int {
+	return call(key, errp, func(h *handle) error {
+		h.player.SetSwitchDeviceRate(on != 0)
+		return nil
+	})
 }
 
 //export liino_snapshot_json

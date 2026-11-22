@@ -13,6 +13,9 @@ import (
 	"github.com/team-quaver/liino/pcm"
 )
 
+// errOutputStale: the pipeline moved to another clock while opening output.
+var errOutputStale = errors.New("liino: pipeline format changed while opening output")
+
 // Read implements output.Source: the device callback drains the pipe and never
 // takes the player lock, so a slow API call cannot starve the audio thread.
 //
@@ -60,23 +63,118 @@ func (p *Player) Read(dst []float32) int {
 // Reset implements output.Source.
 func (p *Player) Reset() { p.pulled.Store(0) }
 
-// ensurePipe makes the pipe carry the given channel count. The callback may
-// still be draining the old pipe; the pointer swap is atomic and the old pipe
-// is interrupted so a producer blocked on it wakes up.
-func (p *Player) ensurePipe(gen uint64, channels int) {
+// pipelineRate is the clock of the pipe the audio callback currently drains.
+// Callers may hold p.mu; it only reads the atomic pipe pointer.
+func (p *Player) pipelineRate() int {
+	pipe := p.pipe.Load()
+	if pipe == nil {
+		return pcm.DefaultSampleRate
+	}
+	if rate := pipe.Format().SampleRate; rate > 0 {
+		return rate
+	}
+	return pcm.DefaultSampleRate
+}
+
+// ringFrames keeps the ring's duration constant when the pipeline clock moves
+// to the source rate: the configured depth is expressed at 48 kHz.
+func (p *Player) ringFrames(rate int) int {
+	if rate <= 0 || rate == pcm.DefaultSampleRate {
+		return p.cfg.RingFrames
+	}
+	frames := p.cfg.RingFrames * rate / pcm.DefaultSampleRate
+	if frames < pcm.ChunkFrames*4 {
+		frames = pcm.ChunkFrames * 4
+	}
+	return frames
+}
+
+// prerollFrames is the buffered depth needed before the device starts, in the
+// pipeline's current clock. The configured value is expressed at 48 kHz.
+func (p *Player) prerollFrames() int {
+	rate := p.pipelineRate()
+	if rate <= 0 || rate == pcm.DefaultSampleRate {
+		return p.cfg.PrerollFrames
+	}
+	return p.cfg.PrerollFrames * rate / pcm.DefaultSampleRate
+}
+
+// ensurePipe makes the pipe carry the given format. The callback may still be
+// draining the old pipe; the pointer swap is atomic and the old pipe is
+// interrupted so a producer blocked on it wakes up.
+func (p *Player) ensurePipe(gen uint64, channels, rate int) {
 	if channels <= 0 {
 		channels = pcm.DefaultChannels
 	}
+	if rate <= 0 {
+		rate = pcm.DefaultSampleRate
+	}
 	cur := p.pipe.Load()
-	if cur != nil && cur.Format().Channels == channels {
+	if cur != nil && cur.Format().Channels == channels && cur.Format().SampleRate == rate {
 		return
 	}
-	next := pcm.NewPipe(p.cfg.RingFrames, pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: channels})
+	next := pcm.NewPipe(p.ringFrames(rate), pcm.Format{SampleRate: rate, Channels: channels})
 	next.Swap(gen)
 	p.pipe.Store(next)
 	if cur != nil {
 		cur.Interrupt()
 	}
+}
+
+// detachOutputForRate retires a session whose clock differs from the decoder's.
+// The caller closes it before the pipe moves, so its callback never sees
+// new-rate frames. ok=false means a newer load superseded gen.
+func (p *Player) detachOutputForRate(gen uint64, rate int) (output.Output, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.gen.curLoad() != gen {
+		return nil, false
+	}
+	if rate <= 0 {
+		return nil, true
+	}
+	if pipe := p.pipe.Load(); pipe != nil && pipe.Format().SampleRate != rate {
+		// Mark the format transition before the device session is retired:
+		// an output open that captured the old clock must not commit between
+		// this point and setStreamFormat.
+		p.gen.nextEpoch()
+	}
+	if p.out == nil || p.out.Format().SampleRate == rate {
+		return nil, true
+	}
+	out := p.out
+	p.out = nil
+	return out, true
+}
+
+// setStreamFormat points pipe, DSP chain and clock at the decoder's format.
+// A mismatched output must already be detached (see detachOutputForRate).
+func (p *Player) setStreamFormat(gen uint64, channels, rate int) bool {
+	if channels <= 0 {
+		channels = pcm.DefaultChannels
+	}
+	if rate <= 0 {
+		rate = pcm.DefaultSampleRate
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.gen.curLoad() != gen {
+		return false
+	}
+	pos := p.clock.position(p.pulled.Load())
+	if pipe := p.pipe.Load(); pipe != nil && pipe.Format().SampleRate != rate {
+		p.gen.nextEpoch()
+	}
+	p.ensurePipe(gen, channels, rate)
+	p.chain.SetFormat(rate, channels)
+	p.outEQ.SetSampleRate(rate)
+	p.outGain.SetSampleRate(rate)
+	p.clock = newClock(rate)
+	p.clock.base = pos
+	p.base = pos
+	p.pulled.Store(0)
+	p.bufferAt = 0
+	return true
 }
 
 // decodeLoop owns one decoder session: it opens the source, runs the DSP chain
@@ -108,12 +206,17 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 	}
 
 	p.mu.Lock()
+	if p.closed || p.gen.curLoad() != gen {
+		p.mu.Unlock()
+		_ = stream.Close()
+		return
+	}
 	p.stream = stream
 	p.decoderName = backend.Name()
 	p.meta = stream.Meta()
 	// The pipe must match what the decoder actually emits. That is the stream's
-	// Format() (canonical 48 kHz + source channels for native, stereo for the
-	// wasm helper), not the container's Meta().
+	// Format() (the source clock when adaptive rate is on, canonical 48 kHz
+	// otherwise), not the container's Meta().
 	srcCh := stream.Format().Channels
 	if srcCh <= 0 {
 		srcCh = p.meta.Channels
@@ -121,13 +224,34 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 	if srcCh <= 0 {
 		srcCh = pcm.DefaultChannels
 	}
-	p.chain.SetFormat(pcm.DefaultSampleRate, srcCh)
-	// The decoder keeps the source layout. Swap the pipe if this track's
-	// channel count differs from the previous one; Read folds it for the
-	// endpoint when necessary (see Read).
-	p.ensurePipe(gen, srcCh)
+	srcRate := stream.Format().SampleRate
+	if srcRate <= 0 {
+		srcRate = p.meta.SampleRate
+	}
+	if srcRate <= 0 {
+		srcRate = pcm.DefaultSampleRate
+	}
 	seekable := p.meta.Seekable
 	p.mu.Unlock()
+
+	// The decoder keeps the source layout, and may now also keep its clock.
+	// A session opened for the previous track cannot be retimed in place; it
+	// is closed here, before any frame at the new rate can reach it.
+	staleOut, ok := p.detachOutputForRate(gen, srcRate)
+	if !ok {
+		_ = stream.Close()
+		return
+	}
+	if staleOut != nil {
+		p.logf("output clock %d Hz -> %d Hz; reopening the session",
+			staleOut.Format().SampleRate, p.pipelineRate())
+		_ = staleOut.Stop()
+		_ = staleOut.Close()
+	}
+	if !p.setStreamFormat(gen, srcCh, srcRate) {
+		_ = stream.Close()
+		return
+	}
 
 	// Seek **outside the player lock**: on an HTTP source this reads ranges from
 	// the network and can stall for seconds. Holding mu here blocks every FFI
@@ -261,11 +385,26 @@ func (p *Player) decodeLoop(ctx context.Context, gen uint64, src decode.Source, 
 		if ch <= 0 {
 			ch = pcm.DefaultChannels
 		}
-		// Raw/live sources sometimes only reveal their layout on the first
-		// decoded frame. Keep the pipe and DSP in sync when that happens.
-		if p.pipe.Load().Format().Channels != ch {
-			p.ensurePipe(gen, ch)
-			p.chain.SetFormat(pcm.DefaultSampleRate, ch)
+		rate := chunk.Format.SampleRate
+		if rate <= 0 {
+			rate = p.pipelineRate()
+		}
+		// Raw/live sources sometimes only reveal their format on the first
+		// decoded frame. Keep the pipe and DSP in sync when that happens; a
+		// clock change also retires the device session, exactly like load.
+		if format := p.pipe.Load().Format(); format.Channels != ch || format.SampleRate != rate {
+			staleOut, ok := p.detachOutputForRate(gen, rate)
+			if !ok {
+				return
+			}
+			if staleOut != nil {
+				p.logf("decoder clock changed to %d Hz; reopening the session", p.pipelineRate())
+				_ = staleOut.Stop()
+				_ = staleOut.Close()
+			}
+			if !p.setStreamFormat(gen, ch, rate) {
+				return
+			}
 		}
 		n := chunk.Frames * ch
 		buf = append(buf[:0], chunk.Data[:n]...)
@@ -365,11 +504,15 @@ func (p *Player) applyPendingSeek(gen uint64, stream decode.Stream) bool {
 }
 
 func (p *Player) decodeOptions() decode.Options {
+	p.mu.Lock()
+	followSource := p.cfg.AdaptiveRate
+	p.mu.Unlock()
 	return decode.Options{
 		ChunkFrames:     pcm.ChunkFrames,
 		OpenTimeout:     15 * time.Second,
 		ProbeBytes:      1 << 20,
 		AnalyzeDuration: 2 * time.Second,
+		FollowSource:    followSource,
 		Log:             p.cfg.Log,
 	}
 }
@@ -424,12 +567,20 @@ func (p *Player) ensureOutput(deviceID string) error {
 	periodFrames := p.cfg.PeriodFrames
 	appName := p.cfg.AppName
 	streamName := p.cfg.StreamName
+	adaptive := p.cfg.AdaptiveRate && p.cfg.SwitchDeviceRate && !p.rateSwitchSlow
 	logf := p.cfg.Log
 	// Negotiate against what the decoder actually feeds the pipe, not the
-	// container metadata (wasm downmixes, native preserves).
-	sourceCh := p.pipe.Load().Format().Channels
+	// container metadata (wasm downmixes, native preserves). The rate is the
+	// pipe's clock: the source rate with adaptive playback, 48 kHz otherwise.
+	pipeFmt := p.pipe.Load().Format()
+	epoch := p.gen.curEpoch()
+	sourceCh := pipeFmt.Channels
 	if sourceCh <= 0 {
 		sourceCh = p.meta.Channels
+	}
+	rate := pipeFmt.SampleRate
+	if rate <= 0 {
+		rate = pcm.DefaultSampleRate
 	}
 	p.mu.Unlock()
 
@@ -443,10 +594,11 @@ func (p *Player) ensureOutput(deviceID string) error {
 	outCh := outputChannelPlan(driverName, deviceID, sourceCh)
 	opts := output.Options{
 		DeviceID:     deviceID,
-		Format:       pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: outCh},
+		Format:       pcm.Format{SampleRate: rate, Channels: outCh},
 		PeriodFrames: periodFrames,
 		AppName:      appName,
 		StreamName:   streamName,
+		AdaptiveRate: adaptive,
 		Source:       p,
 		OnUnderrun:   func(int) { p.onUnderrun() },
 		OnError: func(err error) {
@@ -496,6 +648,13 @@ func (p *Player) ensureOutput(deviceID string) error {
 		p.mu.Unlock()
 		_ = out.Close()
 		return nil
+	}
+	if p.gen.curEpoch() != epoch || p.pipe.Load().Format().SampleRate != pipeFmt.SampleRate {
+		// The decoder moved to another clock while this session was opening.
+		// Keeping it would feed new-rate frames to an old-rate stream.
+		p.mu.Unlock()
+		_ = out.Close()
+		return errOutputStale
 	}
 	p.out = out
 	p.driver = driver
@@ -570,6 +729,9 @@ func (p *Player) startDevice() error {
 	p.mu.Unlock()
 	if out == nil {
 		if err := p.ensureOutput(deviceID); err != nil {
+			if errors.Is(err, errOutputStale) {
+				return err
+			}
 			p.fail(err)
 			return err
 		}
@@ -583,8 +745,30 @@ func (p *Player) startDevice() error {
 		return ErrNotRunning
 	}
 	if err := out.Start(); err != nil {
+		p.mu.Lock()
+		replaced := p.closed || p.out != out
+		p.mu.Unlock()
+		if replaced {
+			// A track/rate change retired this session while it was starting.
+			// The monitor opens the new one; this is not a playback failure.
+			return ErrNotRunning
+		}
 		p.fail(fmt.Errorf("output start: %w", err))
 		return err
+	}
+	// Start() may return after a rate change retired the session. Do not leave
+	// a running stream that nobody will drain.
+	p.mu.Lock()
+	replaced := p.closed || p.out != out
+	if !replaced {
+		p.outStart = time.Now()
+		p.outStartFrames = p.pulled.Load()
+	}
+	p.mu.Unlock()
+	if replaced {
+		_ = out.Stop()
+		_ = out.Close()
+		return ErrNotRunning
 	}
 	p.publish(Event{Kind: KindPlaying, Name: "playing"})
 	return nil
@@ -659,6 +843,7 @@ func (p *Player) monitor() {
 }
 
 func (p *Player) evaluate() {
+	p.checkRateSwitch()
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -675,20 +860,21 @@ func (p *Player) evaluate() {
 
 	avail := p.pipe.Load().Available()
 	period := p.cfg.PeriodFrames
+	preroll := p.prerollFrames()
 	switch p.state {
 	case StateLoading, StateReady:
 		// After an in-place seek the output session is already running. Waiting
 		// for the full preroll again is wrong there: WinRT produces at real
 		// time, so the pipe can stay below the preroll depth forever even while
 		// frames reach the device. Frames actually pulled are the truth.
-		if p.wantPlay && (avail >= p.cfg.PrerollFrames || p.eof || p.framesPulledSince(period)) {
+		if p.wantPlay && (avail >= preroll || p.eof || p.framesPulledSince(period)) {
 			p.state = StatePlaying
 			p.mu.Unlock()
 			p.requestDeviceStart()
 			return
 		}
 	case StateBuffering:
-		if avail >= p.cfg.PrerollFrames/2 || p.framesPulledSince(period) {
+		if avail >= preroll/2 || p.framesPulledSince(period) {
 			p.state = StatePlaying
 			p.mu.Unlock()
 			p.publish(Event{Kind: KindReady, Name: "ready"})
@@ -708,6 +894,27 @@ func (p *Player) evaluate() {
 		return
 	}
 	p.mu.Unlock()
+}
+
+// checkRateSwitch latches a slow device-clock switch so later tracks resample.
+func (p *Player) checkRateSwitch() {
+	slow := false
+	p.mu.Lock()
+	if !p.outStart.IsZero() && p.state == StatePlaying &&
+		p.cfg.AdaptiveRate && p.cfg.SwitchDeviceRate && !p.rateSwitchSlow {
+		switch {
+		case p.pulled.Load() > p.outStartFrames:
+			p.outStart = time.Time{}
+		case time.Since(p.outStart) >= 700*time.Millisecond:
+			p.rateSwitchSlow = true
+			p.outStart = time.Time{}
+			slow = true
+		}
+	}
+	p.mu.Unlock()
+	if slow {
+		p.logf("graph clock switch did not start within 700ms; using PipeWire resampling for the rest of this session")
+	}
 }
 
 // framesPulledSince reports whether the device has consumed at least one
@@ -790,6 +997,17 @@ func (p *Player) checkDevice() {
 	p.logf("output %q no longer usable, switching to %q", current.Name, target.Name)
 	p.publish(Event{Kind: KindDeviceLost, Name: "device-lost"})
 	if err := p.rebuildOutput(target.ID); err != nil {
+		if errors.Is(err, errOutputStale) {
+			// A track switch moved the clock while the device was reopening.
+			// Leave the session closed; the monitor opens it at the new rate.
+			p.mu.Lock()
+			if !p.closed && p.state == StatePlaying {
+				p.state = StateReady
+			}
+			p.mu.Unlock()
+			p.nudge()
+			return
+		}
 		p.fail(fmt.Errorf("recover device: %w", err))
 		return
 	}
@@ -804,7 +1022,7 @@ func (p *Player) checkDevice() {
 	pos := p.clock.position(p.pulled.Load())
 	p.pulled.Store(0)
 	p.bufferAt = 0
-	p.clock = newClock(pcm.DefaultSampleRate)
+	p.clock = newClock(p.pipelineRate())
 	p.clock.base = pos
 	p.wantPlay = state == StatePlaying || state == StateBuffering
 	p.state = StateReady
@@ -829,7 +1047,7 @@ func (p *Player) snapshotLocked() Snapshot {
 		Muted:         p.muted,
 		Decoder:       p.decoderName,
 		Codec:         p.meta.Codec,
-		SampleRate:    pcm.DefaultSampleRate,
+		SampleRate:    p.pipelineRate(),
 		Channels:      snapshotChannels(p.meta.Channels),
 		Live:          p.meta.Live,
 		FramesWritten: p.pulled.Load(),
@@ -877,5 +1095,6 @@ func dbOf(v float64) float64 {
 // bufferedLocked converts the pipe occupancy into a duration.
 func (p *Player) bufferedLocked() time.Duration {
 	frames := float64(p.pipe.Load().Available())
-	return time.Duration(frames / float64(pcm.DefaultSampleRate) * float64(time.Second))
+	rate := p.pipelineRate()
+	return time.Duration(frames / float64(rate) * float64(time.Second))
 }

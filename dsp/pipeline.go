@@ -77,6 +77,7 @@ func (p *Pipeline) SetFormat(rate, channels int) {
 		p.preamp = NewRampGain(p.rate)
 		p.preamp.SetLinear(gain)
 		if p.limiter != nil {
+			p.limiter.SetRate(p.rate)
 			p.limiter.Reset()
 		}
 	}

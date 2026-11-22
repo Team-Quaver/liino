@@ -271,3 +271,10 @@ func (l *Limiter) Process(data []float32, channels int) {
 }
 
 func (l *Limiter) Reset() { l.env = 0 }
+
+// SetRate rebuilds the attack/release coefficients for a new clock.
+func (l *Limiter) SetRate(rate float64) {
+	if rate > 0 {
+		l.rate = rate
+	}
+}

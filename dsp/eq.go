@@ -20,9 +20,11 @@ type EQ struct {
 	// Process. Clearing filter memory directly from a UI call would race with
 	// the callback that owns it.
 	resetReq atomic.Uint64
-	// rate is fixed for the life of the equalizer: it runs on the canonical
-	// ring format, which never changes sample rate mid-stream.
-	rate float64
+	// rate follows the pipeline clock. Adaptive-rate playback can move the
+	// ring onto the source rate, so the audio thread retunes when rateReq
+	// changes instead of assuming 48 kHz forever.
+	rateReq atomic.Int32
+	rate    float64
 	// bypass is the consumer half of Player.SetBypass. The producer chain keeps
 	// its own flag; both must agree or a "bypassed" player would still filter.
 	bypass atomic.Bool
@@ -45,8 +47,18 @@ func NewEQ(rate float64) *EQ {
 		rate = 48000
 	}
 	eq := &EQ{rate: rate}
+	eq.rateReq.Store(int32(rate))
 	eq.target.Store(&eqBands{})
 	return eq
+}
+
+// SetSampleRate moves the equalizer onto a new pipeline clock. Safe to call
+// from the decode goroutine while Process runs on the audio callback: the
+// audio thread re-tunes on its next pass.
+func (e *EQ) SetSampleRate(rate int) {
+	if rate > 0 {
+		e.rateReq.Store(int32(rate))
+	}
 }
 
 // SetBands publishes a new band list. Safe to call from the UI/FFI thread while
@@ -100,6 +112,11 @@ func (e *EQ) Process(data []float32, channels int) {
 		for _, filter := range e.filters {
 			filter.Reset()
 		}
+	}
+	if requested := int(e.rateReq.Load()); requested > 0 && requested != int(e.rate) {
+		e.rate = float64(requested)
+		// Force a rebuild: the old coefficients were derived at the old rate.
+		e.applied = nil
 	}
 	if published := e.target.Load(); published != e.applied {
 		e.retune(published)

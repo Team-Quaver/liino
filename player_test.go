@@ -33,6 +33,9 @@ type fakeBackend struct {
 	// unseekable models a stream whose container has no index (live-ish HTTP):
 	// seeking is refused, so a resume offset cannot be honoured.
 	unseekable bool
+	// rates is the source clock of each successive Open; the last entry repeats.
+	// Empty (or zero entries) means the usual 48 kHz tone.
+	rates []int
 }
 
 type fakeStream struct {
@@ -49,6 +52,7 @@ type fakeStream struct {
 	closed    bool
 	chunkSize int
 	meta      decode.Meta
+	rate      int // clock this stream produces
 }
 
 func (b *fakeBackend) Name() string  { return "fake" }
@@ -57,20 +61,32 @@ func (b *fakeBackend) Probe() (bool, string) {
 	return true, "synthetic tone"
 }
 
-func (b *fakeBackend) Open(context.Context, decode.Source, decode.Options) (decode.Stream, error) {
+func (b *fakeBackend) Open(_ context.Context, _ decode.Source, opts decode.Options) (decode.Stream, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.opened++
 	if b.failErr != nil {
 		return nil, b.failErr
 	}
-	total := pcm.DefaultSampleRate * 2 // two seconds
+	rate := pcm.DefaultSampleRate
+	if len(b.rates) > 0 {
+		index := min(b.opened-1, len(b.rates)-1)
+		if b.rates[index] > 0 {
+			rate = b.rates[index]
+		}
+	}
+	outRate := pcm.DefaultSampleRate
+	if opts.FollowSource {
+		outRate = rate
+	}
+	total := rate * 2 // two seconds
 	s := &fakeStream{
 		frames:    total,
 		chunkSize: pcm.ChunkFrames,
+		rate:      outRate,
 		meta: decode.Meta{
 			Codec:      "fake",
-			SampleRate: pcm.DefaultSampleRate,
+			SampleRate: rate,
 			Channels:   pcm.DefaultChannels,
 			Duration:   2 * time.Second,
 			Seekable:   !b.unseekable,
@@ -100,8 +116,10 @@ func (b *fakeBackend) streamAt(n int) *fakeStream {
 	return b.streams[n]
 }
 
-func (s *fakeStream) Format() pcm.Format { return pcm.DefaultFormat() }
-func (s *fakeStream) Meta() decode.Meta  { return s.meta }
+func (s *fakeStream) Format() pcm.Format {
+	return pcm.Format{SampleRate: s.rate, Channels: pcm.DefaultChannels}
+}
+func (s *fakeStream) Meta() decode.Meta { return s.meta }
 
 func (s *fakeStream) Read() (pcm.Chunk, error) {
 	s.mu.Lock()
@@ -116,9 +134,9 @@ func (s *fakeStream) Read() (pcm.Chunk, error) {
 		return pcm.Chunk{}, io.EOF
 	}
 	n := min(s.chunkSize, s.frames-s.produced)
-	out := pcm.Chunk{Data: make([]float32, n*pcm.DefaultChannels), Frames: n, Format: pcm.DefaultFormat()}
+	out := pcm.Chunk{Data: make([]float32, n*pcm.DefaultChannels), Frames: n, Format: s.Format()}
 	for i := 0; i < n; i++ {
-		t := float64(s.produced+i) / pcm.DefaultSampleRate
+		t := float64(s.produced+i) / float64(s.rate)
 		v := float32(0.2 * math.Sin(2*math.Pi*220*t))
 		out.Data[i*2] = v
 		out.Data[i*2+1] = v
@@ -134,7 +152,7 @@ func (s *fakeStream) Seek(t time.Duration) (time.Duration, error) {
 		return 0, s.seekErr
 	}
 	s.seeked = append(s.seeked, t)
-	s.produced = int(t.Seconds() * pcm.DefaultSampleRate)
+	s.produced = int(t.Seconds() * float64(s.rate))
 	return t, nil
 }
 
@@ -1447,5 +1465,116 @@ func TestLoadAndStopResetBufferHighWater(t *testing.T) {
 	}
 	if got := highWater(); got != 0 {
 		t.Fatalf("bufferAt after Stop = %d, want it reset with the clock", got)
+	}
+}
+
+// AdaptiveRate keeps the source clock end to end. A track change with another
+// rate must retire the previous device session instead of retiming it in
+// place: the old callback may never pull new-rate frames as if they belonged
+// to its own clock.
+func TestAdaptiveRateFollowsSourceClock(t *testing.T) {
+	registerFake(t, &fakeBackend{rates: []int{44100, 96000}})
+	cfg := testConfig("fake")
+	cfg.AdaptiveRate = true
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	events, cancel := p.Events(256)
+	defer cancel()
+
+	sessionRate := func() int {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.out == nil {
+			return 0
+		}
+		return p.out.Format().SampleRate
+	}
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://44k"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	snap := waitState(t, p, events, StatePlaying, 5*time.Second)
+	if snap.SampleRate != 44100 {
+		t.Fatalf("first track sample rate = %d, want 44100", snap.SampleRate)
+	}
+	if clock := p.Clock(); clock.SampleRate != 44100 {
+		t.Fatalf("clock sample rate = %d, want 44100", clock.SampleRate)
+	}
+	if rate := sessionRate(); rate != 44100 {
+		t.Fatalf("output session rate = %d, want 44100", rate)
+	}
+
+	p.mu.Lock()
+	first := p.out
+	p.mu.Unlock()
+
+	if err := p.Open(context.Background(), decode.Source{URI: "fake://96k"}, OpenOptions{AutoPlay: true}); err != nil {
+		t.Fatal(err)
+	}
+	snap = waitState(t, p, events, StatePlaying, 5*time.Second)
+	if snap.SampleRate != 96000 {
+		t.Fatalf("second track sample rate = %d, want 96000", snap.SampleRate)
+	}
+	if rate := sessionRate(); rate != 96000 {
+		t.Fatalf("output session after the rate change = %d, want 96000", rate)
+	}
+	if first != nil && first.State() != output.StateClosed {
+		t.Fatalf("previous output session state = %s, want closed", first.State())
+	}
+}
+
+// A device clock request that never starts producing frames must not be
+// retried on every track: the watchdog latches "slow" so the rest of the
+// session keeps PipeWire resampling and starts instantly.
+func TestRateSwitchWatchdog(t *testing.T) {
+	registerFake(t, &fakeBackend{})
+	p, err := New(testConfig("fake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	stall := func(after time.Duration) bool {
+		p.mu.Lock()
+		p.cfg.AdaptiveRate = true
+		p.cfg.SwitchDeviceRate = true
+		p.state = StatePlaying
+		p.pulled.Store(0)
+		p.outStartFrames = 0
+		p.outStart = time.Now().Add(-after)
+		p.mu.Unlock()
+		p.checkRateSwitch()
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.rateSwitchSlow
+	}
+
+	if stall(100 * time.Millisecond) {
+		t.Fatal("watchdog fired before its window elapsed")
+	}
+	if !stall(800 * time.Millisecond) {
+		t.Fatal("watchdog did not latch after 700ms without frames")
+	}
+
+	// A session that does deliver frames is not marked slow.
+	p.mu.Lock()
+	p.rateSwitchSlow = false
+	p.cfg.AdaptiveRate = true
+	p.cfg.SwitchDeviceRate = true
+	p.state = StatePlaying
+	p.pulled.Store(4096)
+	p.outStartFrames = 0
+	p.outStart = time.Now().Add(-2 * time.Second)
+	p.mu.Unlock()
+	p.checkRateSwitch()
+	p.mu.Lock()
+	slow := p.rateSwitchSlow
+	started := p.outStart
+	p.mu.Unlock()
+	if slow || !started.IsZero() {
+		t.Fatalf("progress should clear the watchdog: slow=%v start=%v", slow, started)
 	}
 }

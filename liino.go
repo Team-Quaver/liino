@@ -3,7 +3,8 @@
 //
 // The pipeline is fixed and boring on purpose:
 //
-//	decode (ffgo / libav.js)  ->  canonical PCM 48kHz stereo float32
+//	decode (ffgo / libav.js)  ->  float32 PCM (48 kHz, or the source clock
+//	                              when Config.AdaptiveRate is on)
 //	    ->  dsp.Pipeline (EQ, effects chain, gain, limiter, fades, meter)
 //	        ->  pcm.Pipe (bounded ring, backpressure)
 //	            ->  output driver (WASAPI / Core Audio / PipeWire)
@@ -69,6 +70,12 @@ type Config struct {
 	Driver string
 	// DeviceID is the endpoint to open. Empty means the system default.
 	DeviceID string
+	// AdaptiveRate keeps the source clock end to end instead of resampling to
+	// 48 kHz. A rate change reopens the output session.
+	AdaptiveRate bool
+	// SwitchDeviceRate also asks the device to move its clock (PipeWire
+	// node.rate). Off by default: the graph resamples, so sound starts at once.
+	SwitchDeviceRate bool
 
 	// AppName and StreamName are what the OS mixer shows. Keep AppName equal to
 	// "Quaver Music" so per-app capture keeps finding the right process.
@@ -205,9 +212,14 @@ type Player struct {
 	// seek that arrives after it retired (end of file, failure) must restart
 	// the source itself: nobody else would read the queued target.
 	loopAlive bool
-	pending   func() // deferred action after a fade, e.g. stop
-	volume    float64
-	muted     bool
+	// rateSwitchSlow latches when a clock switch stalls; later tracks resample.
+	rateSwitchSlow bool
+	// outStart/outStartFrames feed the clock-switch watchdog.
+	outStart       time.Time
+	outStartFrames uint64
+	pending        func() // deferred action after a fade, e.g. stop
+	volume         float64
+	muted          bool
 
 	pulled atomic.Uint64 // frames handed to the device since the last seek
 	// bufferAt records pulled when the pipeline entered StateBuffering. A
@@ -303,13 +315,15 @@ func (p *Player) Open(ctx context.Context, src decode.Source, opts OpenOptions) 
 	p.playIntent = opts.AutoPlay
 	p.seekRebuilds = seekRebuildBudget
 	p.loopAlive = true
+	p.outStart = time.Time{}
+	p.outStartFrames = 0
 	p.dropQueuedSeek() // a target queued for the previous track must not move this one
 	p.pending = nil
 	p.pulled.Store(0)
 	p.bufferAt = 0
 	p.decoded.Store(0)
 	p.base = maxDuration(opts.StartAt, 0)
-	p.clock = newClock(pcm.DefaultSampleRate)
+	p.clock = newClock(p.pipelineRate())
 	p.clock.base = p.base
 	// A stale producer is cut off by the token swap and notices the generation
 	// change, but it no longer owns the stream: this load does. Take the old
@@ -409,6 +423,7 @@ func (p *Player) Pause() error {
 	// "resume?" with yes and start making sound on a track the user paused.
 	p.playIntent = false
 	p.wantPlay = false
+	p.outStart = time.Time{}
 	p.mu.Unlock()
 	if state == StatePaused {
 		return nil
@@ -854,6 +869,30 @@ func (p *Player) SetBypass(bypass bool) {
 	p.outEQ.SetBypass(bypass)
 }
 
+// SetAdaptiveRate toggles source-rate following. It takes effect on the next
+// Open: retiming a running track would rebuild the decoder and the device
+// session underneath the listener, which is exactly the race this player
+// avoids. The track that is already playing keeps its clock.
+func (p *Player) SetAdaptiveRate(on bool) {
+	p.mu.Lock()
+	p.cfg.AdaptiveRate = on
+	p.rateSwitchSlow = false
+	p.outStart = time.Time{}
+	p.mu.Unlock()
+}
+
+// SetSwitchDeviceRate toggles the hardware-clock request independently of
+// source-rate following. Turning it off keeps the stream at the source rate
+// but lets PipeWire resample, so playback starts immediately. It also clears
+// the "this device switches slowly" latch so the next track tries again.
+func (p *Player) SetSwitchDeviceRate(on bool) {
+	p.mu.Lock()
+	p.cfg.SwitchDeviceRate = on
+	p.rateSwitchSlow = false
+	p.outStart = time.Time{}
+	p.mu.Unlock()
+}
+
 // DSPState snapshots the chain for the settings UI. The EQ stage is reported
 // from the consumer-side equalizer, which is where the bands actually run.
 func (p *Player) DSPState() dsp.State {
@@ -996,7 +1035,7 @@ func (p *Player) Clock() Clock {
 		latency = p.out.Latency()
 	}
 	frames := p.pulled.Load()
-	sampleRate := pcm.DefaultSampleRate
+	sampleRate := p.pipelineRate()
 	p.mu.Unlock()
 
 	position := bufferPos - latency
@@ -1097,7 +1136,7 @@ func (p *Player) reopenIf(loadGen, seekGen uint64, at time.Duration, resume bool
 	p.base = at
 	p.pulled.Store(0)
 	p.bufferAt = 0
-	p.clock = newClock(pcm.DefaultSampleRate)
+	p.clock = newClock(p.pipelineRate())
 	p.clock.base = at
 	p.state = StateLoading
 	p.loopAlive = true
@@ -1132,6 +1171,8 @@ func (p *Player) rebuildOutput(deviceID string) error {
 	out := p.out
 	p.out = nil
 	p.gen.nextEpoch()
+	p.rateSwitchSlow = false
+	p.outStart = time.Time{}
 	p.mu.Unlock()
 	if out != nil {
 		_ = out.Stop()

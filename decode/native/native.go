@@ -180,6 +180,14 @@ func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options)
 	if channels <= 0 {
 		channels = pcm.DefaultChannels
 	}
+	// FollowSource keeps the container's clock; a probe without a rate resolves
+	// it from the first decoded frame.
+	outRate := pcm.DefaultSampleRate
+	if opts.FollowSource {
+		outRate = meta.SampleRate
+	} else if opts.SampleRate > 0 {
+		outRate = opts.SampleRate
+	}
 	// Network sources pay a full Range round trip per probe of FFmpeg's
 	// timestamp binary search. Estimate the byte offset from the average
 	// bitrate instead (one seek) and let Seek decode forward to the exact PTS.
@@ -199,7 +207,8 @@ func (backend) Open(ctx context.Context, src decode.Source, opts decode.Options)
 		ptsDen:   info.TimeBase.Den,
 		sample:   meta.SampleRate,
 		chans:    meta.Channels,
-		chunk:    pcm.Chunk{Data: make([]float32, frames*channels), Frames: 0, Format: pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: channels}},
+		outRate:  outRate,
+		chunk:    pcm.Chunk{Data: make([]float32, frames*channels), Frames: 0, Format: pcm.Format{SampleRate: outRate, Channels: channels}},
 	}, nil
 }
 
@@ -229,6 +238,9 @@ type stream struct {
 	hasPend bool
 	sample  int // source sample rate, refreshed when the decoder changes it
 	chans   int // source channel count
+	// outRate is the clock this stream produces (0 until the first frame if the
+	// probe carried no rate).
+	outRate int
 
 	resample   *ffgo.Resampler
 	resampleTo ffgo.AudioFormat
@@ -328,7 +340,11 @@ func (s *stream) push(w *ffgo.FrameWrapper) (int, error) {
 	// channels with no layout), so asking swresample for 12 -> 2 fails inside
 	// swr_convert and the whole track is silent. The player folds channels to
 	// whatever the output endpoint accepts instead.
-	if err := s.ensureResampler(rate, channels, format, channels); err != nil {
+	if s.outRate <= 0 {
+		s.outRate = rate
+		s.chunk.Format.SampleRate = rate
+	}
+	if err := s.ensureResampler(rate, channels, format, channels, s.outRate); err != nil {
 		return 0, err
 	}
 	// Some containers (raw streams, live inputs) probe without parameters; the
@@ -373,7 +389,7 @@ func (s *stream) push(w *ffgo.FrameWrapper) (int, error) {
 	outCh := s.resampleTo.Channels
 	s.chunk.Data = ensureF32Cap(s.chunk.Data, frames*outCh)
 	copy(s.chunk.Data[:frames*outCh], data[:frames*outCh])
-	s.chunk.Format = pcm.Format{SampleRate: pcm.DefaultSampleRate, Channels: outCh}
+	s.chunk.Format = pcm.Format{SampleRate: s.resampleTo.SampleRate, Channels: outCh}
 	return frames, nil
 }
 
@@ -394,10 +410,13 @@ func (s *stream) sourceFormat(w *ffgo.FrameWrapper) (rate, channels int, err err
 	return rate, channels, nil
 }
 
-func (s *stream) ensureResampler(rate, channels int, format ffgo.SampleFormat, dstCh int) error {
+func (s *stream) ensureResampler(rate, channels int, format ffgo.SampleFormat, dstCh, dstRate int) error {
+	if dstRate <= 0 {
+		dstRate = pcm.DefaultSampleRate
+	}
 	from := resampleFrom{rate: rate, channels: channels, format: format}
 	to := ffgo.AudioFormat{
-		SampleRate:   pcm.DefaultSampleRate,
+		SampleRate:   dstRate,
 		Channels:     dstCh,
 		SampleFormat: ffgo.SampleFormatFlt,
 	}
