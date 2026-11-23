@@ -1,4 +1,4 @@
-//go:build !android && !ios && (amd64 || arm64)
+//go:build !android && !ios && (amd64 || arm64 || loong64)
 
 package native
 

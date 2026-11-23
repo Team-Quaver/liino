@@ -1,4 +1,4 @@
-//go:build !ios && !android && (amd64 || arm64)
+//go:build !ios && !android && (amd64 || arm64 || loong64)
 
 // Package swscale provides bindings to FFmpeg's libswscale library.
 // It includes video scaling and pixel format conversion functionality.

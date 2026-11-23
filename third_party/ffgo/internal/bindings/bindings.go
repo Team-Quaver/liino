@@ -1,4 +1,4 @@
-//go:build !ios && !android && (amd64 || arm64)
+//go:build !ios && !android && (amd64 || arm64 || loong64)
 
 // Package bindings handles loading FFmpeg shared libraries and registering
 // function bindings using purego.
@@ -286,9 +286,11 @@ func LibrarySearchPaths() []string {
 			"/usr/local/lib64",
 			"/usr/lib/x86_64-linux-gnu",
 			"/usr/lib/aarch64-linux-gnu",
+			"/usr/lib/loongarch64-linux-gnu",
 			"/usr/local/lib",
 			"/usr/lib",
 			"/lib/x86_64-linux-gnu",
+			"/lib/loongarch64-linux-gnu",
 			"/lib",
 		)
 

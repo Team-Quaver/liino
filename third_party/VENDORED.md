@@ -67,6 +67,10 @@
    `AVFrame.ch_layout` unspecified; `swr_convert_frame` then fails on the first
    frame. Liino calls it before resampling so the data can be copied
    channel-faithfully.
+8. LoongArch: the build tags now include `loong64` (purego carries the
+   dlopen/callback assembly for that ABI), and the Linux library search path
+   includes `/usr/lib/loongarch64-linux-gnu` / `/lib/loongarch64-linux-gnu`.
+   The optional C shim has no loong64 prebuilt; decoding works without it.
 
 ### Why
 

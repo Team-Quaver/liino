@@ -1,4 +1,4 @@
-//go:build android || ios || !(amd64 || arm64)
+//go:build android || ios || (!amd64 && !arm64 && !loong64)
 
 package native
 
@@ -9,9 +9,9 @@ import (
 	"github.com/team-quaver/liino/decode"
 )
 
-// ffgo only binds FFmpeg on amd64/arm64 because the purego calling convention
-// shims are written for those ABIs. Everywhere else the backend stays
-// registered so the UI can still show why it is unavailable.
+// ffgo only binds FFmpeg on the 64-bit ABIs it has been enabled for. Everywhere
+// else the backend stays registered so the UI can still show why it is
+// unavailable.
 func (backend) Probe() (bool, string) {
 	return false, fmt.Sprintf("ffgo: unsupported platform %s/%s", goOS(), goArch())
 }

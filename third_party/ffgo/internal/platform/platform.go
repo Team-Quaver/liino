@@ -1,4 +1,4 @@
-//go:build !ios && !android && (amd64 || arm64)
+//go:build !ios && !android && (amd64 || arm64 || loong64)
 
 // Package platform provides platform detection and capabilities for ffgo.
 // It determines what features are available based on the operating system and architecture.
